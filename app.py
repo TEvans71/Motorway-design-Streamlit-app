@@ -823,14 +823,25 @@ def _slice_area_and_centroid(y_left: float, y_right: float, yc: float, zc: float
             dz_dy.append(z_top - z_arc)
     dz_arr = np.array(dz_dy)
     dy = (y_right - y_left) / n_integration
-    area = np.trapz(dz_arr, y_pts)
+    try:
+        area = np.trapezoid(dz_arr, y_pts)
+    except AttributeError:
+        area = float(((dz_arr[:-1] + dz_arr[1:]) * 0.5 * (y_pts[1:] - y_pts[:-1])).sum())
     if area <= 0:
         return (0.0, (y_left + y_right) / 2.0, ground_level)
-    y_c = np.trapz(y_pts * dz_arr, y_pts) / area
+    try:
+        y_c = np.trapezoid(y_pts * dz_arr, y_pts)
+    except AttributeError:
+        y_c = float((((y_pts * dz_arr)[:-1] + (y_pts * dz_arr)[1:]) * 0.5 * (y_pts[1:] - y_pts[:-1])).sum())
+    y_c = y_c / area
     z_top_vals = np.array([_z_surface_at_y(y, ground_level, Z_finish, B_top, B_base) for y in y_pts])
     z_arc_vals = np.array([_circle_arc_z_at_y(y, yc, zc, R, lower=True) for y in y_pts])
     z_mid = np.where(dz_arr > 0, (z_top_vals + np.where(np.isnan(z_arc_vals), z_top_vals, z_arc_vals)) / 2.0, ground_level)
-    z_c = np.trapz(z_mid * dz_arr, y_pts) / area if area > 0 else ground_level
+    try:
+        z_c = np.trapezoid(z_mid * dz_arr, y_pts)
+    except AttributeError:
+        z_c = float((((z_mid * dz_arr)[:-1] + (z_mid * dz_arr)[1:]) * 0.5 * (y_pts[1:] - y_pts[:-1])).sum())
+    z_c = z_c / area if area > 0 else ground_level
     return (float(area), float(y_c), float(z_c))
 
 
