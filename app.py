@@ -1335,7 +1335,11 @@ if df1 is not None:
     st.subheader("3D Motorway View (static)")
     x_vol = df1["x"].values
     A_vol = df1["A_trap"].values
-    V_fill = np.trapz(A_vol, x_vol)
+    try:
+        V_fill = np.trapezoid(A_vol, x_vol)
+    except AttributeError:
+        # Fallback if trapezoid isn't available for any reason
+        V_fill = float(((A_vol[:-1] + A_vol[1:]) * 0.5 * (x_vol[1:] - x_vol[:-1])).sum())
     st.metric("Estimated fill volume (m³)", f"{V_fill:,.0f}")
     st.caption("Computed from trapezoidal integration of embankment area along chainage.")
     st.latex(r"V_{fill}=\int_0^L A(x)\,dx \approx \sum \frac{A_i+A_{i+1}}{2}\Delta x")
@@ -1725,7 +1729,11 @@ if df1 is not None:
     ]
     x_vol = df1["x"].values
     A_vol = df1["A_trap"].values
-    V_fill = np.trapz(A_vol, x_vol)
+    try:
+        V_fill = np.trapezoid(A_vol, x_vol)
+    except AttributeError:
+        # Fallback if trapezoid isn't available for any reason
+        V_fill = float(((A_vol[:-1] + A_vol[1:]) * 0.5 * (x_vol[1:] - x_vol[:-1])).sum())
     sum_rows.append({"Metric": "Fill volume (m³)", "Value": f"{V_fill:,.0f}"})
     if run_slope_stability and slope_stab_result is not None:
         min_FOS_val = slope_stab_result[0]
