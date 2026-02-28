@@ -16,6 +16,15 @@ from mpl_toolkits.mplot3d import Axes3D
 import pandas as pd
 import numpy as np
 
+from geotech_core_settlement import (
+    StressInputs,
+    build_settlement_integration_table,
+    build_settlement_integration_table_mv,
+    consolidation_times_table,
+    settlement_primary_1d,
+    sigma_v0_prime_kpa,
+)
+
 # =============================================================================
 # 1) DEFAULT INPUTS — WEEK 1 (overwritten by sidebar on Run)
 # =============================================================================
@@ -29,7 +38,7 @@ GROUP_DEFAULTS = {
     "ga": 49.6, "gb": 50.5, "xc": 500.0, "bc": 30.05, "bdown": True,
     "btop": 43.3, "m": 2.0,
     "flood": 54.0, "fb": 1.0, "z0": 55.0, "grade": 1.0 / 200.0,
-    "gf": 20.0, "gc": 18.0, "gw": 10.0, "wt": True,
+    "gf": 20.0, "gc": 18.0, "gw": 10.0, "wt": True, "zw": 0.0,
     "cm": "mv", "mv": 0.0005, "Cc": 0.35, "e0": 0.335,
     "cu": 15.0, "Is": 1.0, "Ecu": 300.0,
     "xw": 500.0, "xs": 500.0,
@@ -55,6 +64,7 @@ gamma_fill = 20.0
 gamma_clay = 18.0
 gamma_w = 10.0
 water_table_at_ground = True
+z_wt_m = 0.0
 m_v = 0.0005
 Cc = 0.35
 e0 = 0.335
@@ -77,7 +87,20 @@ consol_stress_point = "Centre (x = 0)"
 Uv_targets = [0.20, 0.50, 0.90]
 Cv_m2_per_s = 1e-7
 vertical_drainage = "double"
-SECONDS_PER_YEAR = 365.0 * 24.0 * 3600.0
+SECONDS_PER_YEAR = 365.25 * 24.0 * 3600.0
+EVIDENCE_NOTES = [
+    "Finish level constraint: Z_minfinish = 54 + 1 = 55 m AOD",
+    "Vertical shift: ΔZ = max(0, 55 − min(Z_design_raw))",
+    "Z_finish(x) = Z_design_raw(x) + ΔZ",
+    "H_fill(x) = max(0, Z_finish(x) − Z_ground(x))",
+    "z_wt(x) = max(0, Z_ground(x) − 54)",
+    "σ′v0(z) = σv(z) − u(z)",
+    "ds=(Cc/(1+e0)) dz log10((σ′0+Δσ)/σ′0)",
+    "Tv=Cv t/Hd²; Hd=H0 or H0/2",
+]
+FLOOD_10YR_AOD_M = 54.0
+FREEBOARD_M = 1.0
+Z_MIN_FINISH_AOD_M = FLOOD_10YR_AOD_M + FREEBOARD_M  # 55.0 m AOD
 
 # =============================================================================
 # 2) HELPERS — WEEK 1 (Ted's logic, unchanged)
@@ -102,12 +125,11 @@ def bedrock_level(x: float) -> float:
 def finished_profile(chainages):
     """Crowned profile: peak at x_peak = x_c, slope g = grade each side."""
     x_peak = x_c
-    Z = [Z_peak_finish - grade * abs(x - x_peak) for x in chainages]
-    zmin = min(Z)
-    if zmin < Zmin_finish:
-        shift = Zmin_finish - zmin
-        Z = [v + shift for v in Z]
-    return Z
+    Z_design_raw = [Z_peak_finish - grade * abs(x - x_peak) for x in chainages]
+    Z_shift = max(0.0, Z_MIN_FINISH_AOD_M - float(np.min(Z_design_raw)))
+    Z_design = [z + Z_shift for z in Z_design_raw]
+    Z_finish = [max(z, Z_MIN_FINISH_AOD_M) for z in Z_design]
+    return Z_finish
 
 def B_base_from_H(H_fill: float) -> float:
     H = max(0.0, float(H_fill))
@@ -300,66 +322,124 @@ def week1_calculate():
     rho_c_edge_list = []
     rho_c_method_list = []
     rho_c_point_list = []
-    rho_c_baseline_list = []
+    layer_tables_by_chainage = {}
+    sigma_v0_prime_mins = []
 
-    def _single_point_rho_c(q, B, h0, x_offset):
-        z_mid = 0.5 * h0
-        d_sigma = delta_sigma_strip(q, B, z_mid, x=x_offset)
-        if consol_method.lower() == "mv":
-            return m_v * d_sigma * h0
-        sigma_v0 = gamma_clay * z_mid
-        u = gamma_w * z_mid if water_table_at_ground else 0.0
-        sigma_v0_prime = max(1e-6, sigma_v0 - u)
-        ratio = (sigma_v0_prime + d_sigma) / sigma_v0_prime
-        return (h0 / (1.0 + e0)) * Cc * math.log10(ratio)
+    stress_inputs_by_chainage = {}
+    n_slices_settlement = 60
+    log_base_settlement = 10.0
+    consol_method_value = str(consol_method).strip().lower()
+    S_cc_slices_by_chainage = {}
+    S_mv_slices_by_chainage = {}
 
-    def _layered_rho_c(q, B, h0, x_offset):
-        rc_total, _ = consolidation_layers(
-            consol_method, h0, q, B, x_offset, N_layers,
-            m_v, Cc, e0, gamma_clay, gamma_w, water_table_at_ground
+    for chainage_idx, (q, B, h0, x_val, g_level) in enumerate(zip(qeq, B_base, H0_list, chainages, ground)):
+        if use_flood_wt:
+            z_wt_chain = max(0.0, float(g_level) - FLOOD_10YR_AOD_M)
+        else:
+            z_wt_chain = 0.0 if water_table_at_ground else float(z_wt_m)
+        stress_inputs = StressInputs(
+            gamma_unsat_kN_m3=float(gamma_clay),
+            gamma_sat_kN_m3=float(gamma_clay),
+            gamma_w_kN_m3=float(gamma_w),
+            z_wt_m=z_wt_chain,
         )
-        return rc_total
+        stress_inputs_by_chainage[x_val] = stress_inputs
+        delta_sigma_func = (lambda z, qval=q: float(qval))
 
-    for chainage_idx, (q, B, h0) in enumerate(zip(qeq, B_base, H0_list)):
         if h0 <= 0.0 or q <= 0.0:
             Delta_sigma_mid.append(0.0)
             rho_c.append(0.0)
             rho_c_centre_list.append(0.0)
             rho_c_edge_list.append(0.0)
-            rho_c_method_list.append("single" if depth_method == "Single-point (lecture baseline: z = H0/2)" else "layered")
-            rho_c_point_list.append("centre" if "Centre" in consol_point else "edge")
-            rho_c_baseline_list.append(0.0)
+            rho_c_method_list.append("mv slices (uniform Δσ)" if consol_method_value == "mv" else "Terzaghi 1D log10 (uniform Δσ)")
+            rho_c_point_list.append("centre (uniform Δσ)")
+            S_cc_slices_by_chainage[x_val] = 0.0
+            S_mv_slices_by_chainage[x_val] = 0.0
+            layer_tables_by_chainage[x_val] = pd.DataFrame(columns=[
+                "z_mid_m", "dz_m", "sigma_v0_prime_kpa", "delta_sigma_kpa",
+                "sigma_vf_prime_kpa", "ds_m", "s_cum_m",
+            ])
             continue
 
-        z_mid = 0.5 * h0
-        d_sigma_baseline = delta_sigma_strip(q, B, z_mid, x=0.0)
-        Delta_sigma_mid.append(d_sigma_baseline)
+        Delta_sigma_mid.append(delta_sigma_func(0.5 * h0))
 
-        if depth_method == "Single-point (lecture baseline: z = H0/2)":
-            rc_centre = _single_point_rho_c(q, B, h0, 0.0)
-            rc_edge = _single_point_rho_c(q, B, h0, B / 2.0)
+        S_cc_slices_m, _ = settlement_primary_1d(
+            H0=h0,
+            Cc=Cc,
+            e0=e0,
+            delta_sigma_func=delta_sigma_func,
+            stress=stress_inputs,
+            n_slices=n_slices_settlement,
+            log_base=log_base_settlement,
+        )
+        layer_table = build_settlement_integration_table(
+            H0=h0,
+            Cc=Cc,
+            e0=e0,
+            delta_sigma_func=delta_sigma_func,
+            stress=stress_inputs,
+            n_slices=n_slices_settlement,
+            log_base=log_base_settlement,
+        )
+        mv_result = build_settlement_integration_table_mv(
+            H0=h0,
+            m_v=float(m_v),
+            delta_sigma_func=delta_sigma_func,
+            stress=stress_inputs,
+            n_slices=int(n_slices_settlement),
+        )
+        if isinstance(mv_result, dict):
+            if "S_total_m" in mv_result:
+                S_mv_slices_m = float(mv_result["S_total_m"])
+            else:
+                mv_rows = mv_result.get("rows")
+                S_mv_slices_m = float(mv_rows["s_cum_m"].iloc[-1]) if mv_rows is not None and len(mv_rows) > 0 else 0.0
         else:
-            rc_centre = _layered_rho_c(q, B, h0, 0.0)
-            rc_edge = _layered_rho_c(q, B, h0, B / 2.0)
-        rho_c_centre_list.append(rc_centre)
-        rho_c_edge_list.append(rc_edge)
+            S_mv_slices_m = float(mv_result[1]) if len(mv_result) > 1 else 0.0
 
-        x_offset_consol = 0.0 if consol_point == "Centre (x = 0)" else B / 2.0
-        rc_active = rc_centre if consol_point == "Centre (x = 0)" else rc_edge
-        rho_c.append(rc_active)
-        rho_c_method_list.append("single" if depth_method == "Single-point (lecture baseline: z = H0/2)" else "layered")
-        rho_c_point_list.append("centre" if "Centre" in consol_point else "edge")
+        S_cc_slices_by_chainage[x_val] = float(S_cc_slices_m)
+        S_mv_slices_by_chainage[x_val] = float(S_mv_slices_m)
 
-        rho_c_baseline = 0.0
-        if consol_method.lower() == "mv":
-            rho_c_baseline = m_v * d_sigma_baseline * h0
-        elif consol_method.lower() == "cc":
-            sigma_v0 = gamma_clay * z_mid
-            u = gamma_w * z_mid if water_table_at_ground else 0.0
-            sigma_v0_prime = max(1e-6, sigma_v0 - u)
-            ratio = (sigma_v0_prime + d_sigma_baseline) / sigma_v0_prime
-            rho_c_baseline = (h0 / (1.0 + e0)) * Cc * math.log10(ratio)
-        rho_c_baseline_list.append(rho_c_baseline)
+        if consol_method_value == "mv":
+            rho_c_x = float(S_mv_slices_m)
+        else:
+            rho_c_x = float(S_cc_slices_m)
+
+        layer_tables_by_chainage[x_val] = layer_table.copy()
+        if len(layer_table) > 0:
+            sigma_v0_prime_mins.append(layer_table["sigma_v0_prime_kpa"].min())
+
+        # --- Local monotonicity check (evidence-based, same chainage) ---
+        # Settlement should increase if the applied load increases at the SAME x (same σ'0 + same H0).
+        # This is the only valid monotonicity sanity check.
+        eps = 0.05  # 5% load bump (small enough to be "local")
+        q_base = float(q)  # q_equiv_kpa at this chainage
+        S_base = float(S_cc_slices_m)
+        S_plus_m, _ = settlement_primary_1d(
+            H0=h0,
+            Cc=Cc,
+            e0=e0,
+            delta_sigma_func=lambda z, qval=q_base * (1.0 + eps): float(qval),
+            stress=stress_inputs,
+            n_slices=60,
+            log_base=10,
+        )
+        tol = 1e-9
+        if S_plus_m + tol < S_base:
+            monotonic_warnings.append({
+                "x": float(x_val),
+                "q_equiv_kpa": q_base,
+                "S_base_m": S_base,
+                "q_plus_kpa": q_base * (1.0 + eps),
+                "S_plus_m": float(S_plus_m),
+                "message": "Local monotonicity failed: load increased at same chainage but settlement decreased. Check σ′0/Δσ/log handling.",
+            })
+
+        rho_c.append(rho_c_x)
+        rho_c_centre_list.append(rho_c_x)
+        rho_c_edge_list.append(rho_c_x)
+        rho_c_method_list.append("mv slices (uniform Δσ)" if consol_method_value == "mv" else "Terzaghi 1D log10 (uniform Δσ)")
+        rho_c_point_list.append("centre (uniform Δσ)")
 
     rho = [ri + rc for ri, rc in zip(rho_i, rho_c)]
     rho_total_centre = [ri + rc for ri, rc in zip(rho_i, rho_c_centre_list)]
@@ -378,31 +458,38 @@ def week1_calculate():
     })
 
     layers_df_for_x_section = None
-    if depth_method == "Layered (sum over N layers)":
+    layer_table_x0 = None
+    if len(layer_tables_by_chainage) > 0:
         idx_sec = (df["x"] - x_section).abs().idxmin()
-        r_sec = df.loc[idx_sec]
-        q_sec = float(r_sec["q_equiv"])
-        B_sec = float(r_sec["B_base"])
-        H0_sec = float(r_sec["H0"])
-        x_off = 0.0 if consol_point == "Centre (x = 0)" else B_sec / 2.0
-        _, layers_df_for_x_section = consolidation_layers(
-            consol_method, H0_sec, q_sec, B_sec, x_off, N_layers,
-            m_v, Cc, e0, gamma_clay, gamma_w, water_table_at_ground
-        )
+        x_sec_val = float(df.loc[idx_sec, "x"])
+        layers_df_for_x_section = layer_tables_by_chainage.get(x_sec_val, None)
+        idx_x0 = (df["x"] - 0.0).abs().idxmin()
+        x0_val = float(df.loc[idx_x0, "x"])
+        layer_table_x0 = layer_tables_by_chainage.get(x0_val, None)
+        if (layer_table_x0 is None or len(layer_table_x0) == 0) and any(len(t) > 0 for t in layer_tables_by_chainage.values()):
+            # Fallback: use first available slice table if x=0 has no clay
+            for t in layer_tables_by_chainage.values():
+                if t is not None and len(t) > 0:
+                    layer_table_x0 = t
+                    break
 
-    baseline_vs_layered_summary = []
+    settlement_summary = []
     for x_check in [x_worked, 0.0, 500.0, 1000.0]:
         idx = (df["x"] - x_check).abs().idxmin()
         r = df.loc[idx]
-        pos = df.index.get_loc(idx)
-        rho_c_base = rho_c_baseline_list[pos]
-        rho_c_curr = float(r["rho_c"])
-        pct = 100.0 * (rho_c_curr - rho_c_base) / rho_c_base if rho_c_base > 1e-12 else 0.0
-        baseline_vs_layered_summary.append({
-            "x": x_check,
-            "rho_c_baseline": rho_c_base,
-            "rho_c_chosen": rho_c_curr,
-            "pct_diff": pct,
+        x_val = float(r["x"])
+        lt = layer_tables_by_chainage.get(x_val)
+        sigma_min = float(lt["sigma_v0_prime_kpa"].min()) if lt is not None and len(lt) > 0 else float("nan")
+        settlement_summary.append({
+            "x": x_val,
+            "H0": float(r["H0"]),
+            "q_equiv": float(r["q_equiv"]),
+            "S_primary_m": float(rho_c[df.index.get_loc(idx)]),
+            "consol_method_used": consol_method_value,
+            "S_cc_slices_m": float(S_cc_slices_by_chainage.get(x_val, 0.0)),
+            "S_mv_slices_m": float(S_mv_slices_by_chainage.get(x_val, 0.0)),
+            "sigma_v0_prime_min_kpa": sigma_min,
+            "z_wt_m_used": float(stress_inputs_by_chainage.get(x_val).z_wt_m) if x_val in stress_inputs_by_chainage else float("nan"),
         })
     key_rows = []
     def add_row(label, idx):
@@ -421,8 +508,13 @@ def week1_calculate():
     idx_w = (df["x"] - float(x_worked)).abs().idxmin()
     rw = df.loc[idx_w]
     z_mid = 0.5 * float(rw["H0"])
-    pos_w = df.index.get_loc(idx_w)
-    rho_c_baseline_w = rho_c_baseline_list[pos_w]
+    sigma_total_mid = stress_inputs.gamma_unsat_kN_m3 * min(z_mid, stress_inputs.z_wt_m)
+    if z_mid > stress_inputs.z_wt_m:
+        sigma_total_mid += stress_inputs.gamma_sat_kN_m3 * (z_mid - stress_inputs.z_wt_m)
+    u_mid = 0.0 if z_mid <= stress_inputs.z_wt_m else stress_inputs.gamma_w_kN_m3 * (z_mid - stress_inputs.z_wt_m)
+    sigma_eff_mid = sigma_total_mid - u_mid
+    sigma_eff_mid_clipped = sigma_v0_prime_kpa(z_mid, stress_inputs)
+    delta_sigma_mid = Delta_sigma_mid[df.index.get_loc(idx_w)]
     report = []
     report.append(f"WEEK 1 WORKED EXAMPLE @ x = {float(rw['x']):.1f} m")
     report.append("")
@@ -445,37 +537,19 @@ def week1_calculate():
     report.append(f"  E_u = (E/c_u)c_u = {Eu_over_cu:.1f}*{cu:.3f} = {Eu_over_cu*cu:.3f} kPa")
     report.append(f"  ρ_i = ({float(rw['q_equiv']):.3f}*{float(rw['B_base']):.3f}*{Is:.3f})/{Eu_over_cu*cu:.3f} = {float(rw['rho_i']):.3f} m")
     report.append("")
-    report.append("Stress increment under strip (Craig)")
-    report.append("  σ_z = (q/π){ α + sinα cos(α+2β) }")
-    report.append(f"  z = H0/2 = {z_mid:.3f} m")
-    report.append(f"  Δσ = {float(rw['Delta_sigma_mid']):.3f} kPa")
+    report.append("Pre-fill effective stress σ′v0 (natural ground only)")
+    report.append("  σv(z) = γ_unsat z (z ≤ z_wt); else γ_unsat z_wt + γ_sat (z - z_wt)")
+    report.append(f"  σv(z_mid={z_mid:.3f}) = {sigma_total_mid:.3f} kPa")
+    report.append(f"  u(z_mid) = γ_w (z - z_wt) = {u_mid:.3f} kPa")
+    report.append(f"  σ′v0 = σv - u = {sigma_eff_mid:.3f} kPa (clipped to {sigma_eff_mid_clipped:.3f} kPa)")
     report.append("")
-    if consol_method.lower() == "mv":
-        report.append("Consolidation settlement (mv)")
-        report.append("  ρ_c = m_v Δσ H0")
-        report.append(f"  = {m_v:.6f}*{float(rw['Delta_sigma_mid']):.3f}*{float(rw['H0']):.3f} = {float(rw['rho_c']):.3f} m")
-    else:
-        report.append("Consolidation settlement (Cc)")
-        report.append("  ρ_c = H0/(1+e0) * Cc * log10((σ'v0 + Δσ)/σ'v0)")
-    if depth_method == "Layered (sum over N layers)":
-        x_off = 0.0 if consol_point == "Centre (x = 0)" else float(rw["B_base"]) / 2.0
-        d_sig_sp = delta_sigma_strip(float(rw["q_equiv"]), float(rw["B_base"]), z_mid, x=x_off)
-        if consol_method.lower() == "mv":
-            rho_c_single_point_same_x = m_v * d_sig_sp * float(rw["H0"])
-        else:
-            sigma_v0 = gamma_clay * z_mid
-            u = gamma_w * z_mid if water_table_at_ground else 0.0
-            sigma_v0_prime = max(1e-6, sigma_v0 - u)
-            ratio = (sigma_v0_prime + d_sig_sp) / sigma_v0_prime
-            rho_c_single_point_same_x = (float(rw["H0"]) / (1.0 + e0)) * Cc * math.log10(ratio)
-        report.append("")
-        report.append("Layered consolidation:")
-        report.append(f"  N_layers = {N_layers}")
-        report.append(f"  stress point = {'centre' if 'Centre' in consol_point else 'edge'}")
-        report.append(f"  rho_c_layered = {float(rw['rho_c']):.3f} m")
-        report.append(f"  rho_c_single_point_same_x = {rho_c_single_point_same_x:.3f} m")
-        pct_diff = 100.0 * (float(rw["rho_c"]) - rho_c_single_point_same_x) / rho_c_single_point_same_x if rho_c_single_point_same_x > 1e-12 else 0.0
-        report.append(f"  % difference = {pct_diff:.2f}%")
+    report.append("Δσ assumption (wide embankment → near-uniform stress)")
+    report.append("  Δσ(z) = q_equiv (constant with depth)")
+    report.append(f"  Δσ = {delta_sigma_mid:.3f} kPa")
+    report.append("")
+    report.append("Primary consolidation (Terzaghi 1D, log10)")
+    report.append("  ds = (Cc/(1+e0)) dz log10((σ′0+Δσ)/σ′0)")
+    report.append(f"  ρ_c (sum over slices) = {float(rw['rho_c']):.3f} m")
     report.append("")
     report.append("Total settlement and revised level")
     report.append("  ρ = ρ_i + ρ_c")
@@ -485,12 +559,21 @@ def week1_calculate():
     report_df = pd.DataFrame({"text": report})
     summary = []
     summary.append("WEEK 1 SUMMARY")
-    summary.append(f"Consolidation method: {consol_method}")
+    summary.extend(EVIDENCE_NOTES)
+    summary.append("Finished level constraint: Z_finish(x)=max(Z_design(x), 55.0 m AOD) using 10-year flood level 54.0 m AOD + 1 m freeboard.")
+    summary.append("WT depth for σ′v0 computed from AOD: z_wt(x)=max(0, Z_ground(x)−54.0).")
     summary.append(f"Max H_fill = {df['H_fill'].max():.3f} m")
     summary.append(f"Max ρ total = {df['rho'].max():.3f} m")
     summary.append(f"Max ρ_i = {df['rho_i'].max():.3f} m")
     summary.append(f"Max ρ_c = {df['rho_c'].max():.3f} m")
     summary_df = pd.DataFrame({"text": summary})
+
+    if any(not np.isfinite(val) for val in rho_c):
+        raise ValueError("Non-finite consolidation settlement encountered.")
+    if len(rho_c) > 0 and min(rho_c) < 0:
+        raise ValueError("Negative consolidation settlement encountered.")
+    if sigma_v0_prime_mins and min(sigma_v0_prime_mins) <= 0:
+        raise ValueError("σ′v0 <= 0 detected; check stress model inputs.")
 
     neg_dsigma_chainages = []
     for i, ds in enumerate(Delta_sigma_mid):
@@ -499,7 +582,17 @@ def week1_calculate():
     if neg_dsigma_chainages:
         pass  # UI will show st.warning
 
-    return df, key_df, report_df, summary_df, layers_df_for_x_section, baseline_vs_layered_summary, neg_dsigma_chainages
+    return (
+        df,
+        key_df,
+        report_df,
+        summary_df,
+        layers_df_for_x_section,
+        settlement_summary,
+        neg_dsigma_chainages,
+        layer_table_x0,
+        monotonic_warnings,
+    )
 
 
 # =============================================================================
@@ -555,31 +648,6 @@ def export_week1_excel(df, key_df, report_df, summary_df, layers_df_for_x_sectio
 # 5) WEEK 2 FUNCTIONS
 # =============================================================================
 
-def Tv_from_Uv(Uv: float) -> float:
-    if Uv <= 0.0:
-        return 0.0
-    if Uv >= 1.0:
-        return float("inf")
-    if Uv < 0.60:
-        return (math.pi / 4.0) * (Uv ** 2)
-    remaining = max(1e-9, 100.0 - 100.0 * Uv)
-    return 1.781 - 0.933 * math.log10(remaining)
-
-def vertical_drainage_path_d(H: float, drainage: str) -> float:
-    drainage = (drainage or "").strip().lower()
-    if drainage == "double":
-        return H / 2.0
-    if drainage == "single":
-        return H
-    raise ValueError("vertical_drainage must be 'single' or 'double'")
-
-def time_from_Tv(Tv: float, d: float, Cv: float) -> float:
-    if Cv <= 0.0:
-        raise ValueError("Cv must be > 0")
-    if Tv == float("inf"):
-        return float("inf")
-    return Tv * (d ** 2) / Cv
-
 def week2_run(df_week1_chainage: pd.DataFrame):
     """Compute vertical consolidation time along chainage (Week 2A only)."""
     if "H0" not in df_week1_chainage.columns:
@@ -587,15 +655,101 @@ def week2_run(df_week1_chainage: pd.DataFrame):
     rows = []
     for _, r in df_week1_chainage.iterrows():
         x, H = float(r["x"]), float(r["H0"])
-        d = vertical_drainage_path_d(H, vertical_drainage)
-        row = {"x": x, "H0": H, "vertical_drainage": vertical_drainage, "d": d, "Cv_m2_per_s": Cv_m2_per_s}
-        for Uv in Uv_targets:
-            Tv = Tv_from_Uv(float(Uv))
-            t_sec = time_from_Tv(Tv, d, Cv_m2_per_s)
-            row[f"Uv={Uv:.2f}_Tv"] = Tv
-            row[f"Uv={Uv:.2f}_t_years"] = t_sec / SECONDS_PER_YEAR
+        if H <= 0.0:
+            rows.append({
+                "x": x,
+                "H0": H,
+                "vertical_drainage": vertical_drainage,
+                "Hd_m": 0.0,
+                "Cv_m2_per_s": Cv_m2_per_s,
+            })
+            continue
+        times_df = consolidation_times_table(
+            Cv_m2_per_s=Cv_m2_per_s,
+            H0_m=H,
+            drainage=vertical_drainage,
+            U_targets=Uv_targets,
+        )
+        row = {
+            "x": x,
+            "H0": H,
+            "vertical_drainage": vertical_drainage,
+        }
+        if len(times_df) > 0:
+            row["Hd_m"] = float(times_df.iloc[0]["Hd_m"])
+            row["Cv_m2_per_s"] = float(times_df.iloc[0]["Cv_m2_per_s"])
+            for col in times_df.columns:
+                if col.startswith("U") and ("Tv" in col or "t_years" in col):
+                    row[col] = float(times_df.iloc[0][col])
+            # Sanity gate: t20 < t50 < t90
+            try:
+                t20 = row.get("U20_t_years", None)
+                t50 = row.get("U50_t_years", None)
+                t90 = row.get("U90_t_years", None)
+                if all(v is not None for v in [t20, t50, t90]):
+                    if not (t20 < t50 < t90):
+                        raise ValueError(f"Consolidation time monotonicity failed at x={x:.1f} m.")
+            except KeyError:
+                pass
         rows.append(row)
     return pd.DataFrame(rows)
+
+import numpy as np
+import pandas as pd
+
+def summarize_x0_settlement_and_consolidation(layer_table_x0: pd.DataFrame, cons_times_df: pd.DataFrame) -> dict:
+    """
+    Summarise min/max slice quantities at x=0.
+    Assumes layer_table_x0 has columns:
+      z_mid_m, sigma_v0_prime_kpa, delta_sigma_kpa, ds_m, s_cum_m
+    Assumes cons_times_df contains row for x=0 with:
+      Hd_m, U20_Tv, U20_t_years, U50_Tv, U50_t_years, U90_Tv, U90_t_years
+    """
+    out = {}
+
+    if layer_table_x0 is None or layer_table_x0.empty:
+        out["ok"] = False
+        out["reason"] = "layer_table_x0 is empty"
+        return out
+
+    df = layer_table_x0.copy()
+
+    # --- ranges over depth (slices) ---
+    out["ok"] = True
+    out["sigma_v0_prime_min_kpa"] = float(df["sigma_v0_prime_kpa"].min())
+    out["sigma_v0_prime_max_kpa"] = float(df["sigma_v0_prime_kpa"].max())
+
+    out["delta_sigma_min_kpa"] = float(df["delta_sigma_kpa"].min())
+    out["delta_sigma_max_kpa"] = float(df["delta_sigma_kpa"].max())
+
+    out["ds_min_m"] = float(df["ds_m"].min())
+    out["ds_max_m"] = float(df["ds_m"].max())
+
+    # where ds is largest (dominant slice)
+    idx = int(df["ds_m"].idxmax())
+    out["ds_max_z_mid_m"] = float(df.loc[idx, "z_mid_m"])
+    out["ds_max_sigma_v0_prime_kpa"] = float(df.loc[idx, "sigma_v0_prime_kpa"])
+    out["ds_max_delta_sigma_kpa"] = float(df.loc[idx, "delta_sigma_kpa"])
+
+    # total primary consolidation settlement at x=0
+    out["S_primary_m"] = float(df["s_cum_m"].iloc[-1])
+    out["S_primary_mm"] = out["S_primary_m"] * 1000.0
+
+    # --- consolidation time row (x=0) ---
+    times_row = None
+    if cons_times_df is not None and not cons_times_df.empty:
+        if "x" in cons_times_df.columns:
+            i0 = int((cons_times_df["x"].astype(float) - 0.0).abs().idxmin())
+            times_row = cons_times_df.loc[i0]
+        else:
+            times_row = cons_times_df.iloc[0]
+
+    if times_row is not None:
+        for k in ["Hd_m", "U20_Tv", "U20_t_years", "U50_Tv", "U50_t_years", "U90_Tv", "U90_t_years"]:
+            if k in times_row.index:
+                out[k] = float(times_row[k])
+
+    return out
 
 def export_add_week2_sheets(out_path: str, week2_chainage_df: pd.DataFrame) -> str:
     """Add Week2_ConsolTime (vertical consolidation) sheet to workbook."""
@@ -615,6 +769,46 @@ def export_add_week2_sheets(out_path: str, week2_chainage_df: pd.DataFrame) -> s
         with pd.ExcelWriter(copy_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
             week2_chainage_df.to_excel(writer, sheet_name="Week2_ConsolTime", index=False)
         return copy_path
+
+
+def export_additional_csvs(df, week2_chainage_df, layer_table_x0=None):
+    """CSV exports for settlement and consolidation evidence."""
+    ensure_dir(OUTPUT_FOLDER)
+    paths = {}
+
+    if df is not None and len(df) > 0:
+        sett_df = pd.DataFrame({
+            "x_m": df["x"],
+            "S_primary_m": df["rho_c"],
+            "S_primary_mm": df["rho_c"] * 1000.0,
+        })
+        p_sett = os.path.join(OUTPUT_FOLDER, "settlement_vs_chainage.csv")
+        sett_df.to_csv(p_sett, index=False)
+        paths["settlement_vs_chainage"] = p_sett
+
+    if layer_table_x0 is not None and len(layer_table_x0) > 0:
+        p_layer = os.path.join(OUTPUT_FOLDER, "settlement_layer_table_x0.csv")
+        layer_table_x0.to_csv(p_layer, index=False)
+        paths["settlement_layer_table_x0"] = p_layer
+
+    if week2_chainage_df is not None and len(week2_chainage_df) > 0:
+        p_consol = os.path.join(OUTPUT_FOLDER, "consolidation_times.csv")
+        week2_chainage_df.to_csv(p_consol, index=False)
+        paths["consolidation_times"] = p_consol
+
+    if df is not None and len(df) > 0:
+        align_df = pd.DataFrame({
+            "chainage_m": df["x"],
+            "Z_design_mAOD": df["Z_finish"],
+            "settlement_total_m": df["rho"],
+            "Z_construct_mAOD": df["Z_rev"],
+            "note": "Z_construct = Z_design + settlement (design as post-settlement target).",
+        })
+        p_align = os.path.join(OUTPUT_FOLDER, "alignment_profiles.csv")
+        align_df.to_csv(p_align, index=False)
+        paths["alignment_profiles"] = p_align
+
+    return paths
 
 
 # =============================================================================
@@ -1116,7 +1310,15 @@ with st.sidebar.expander("Soils & consolidation"):
     gamma_clay = st.number_input("γ_clay (kN/m³)", value=18.0, step=1.0, key="gc")
     gamma_w = st.number_input("γ_w (kN/m³)", value=10.0, step=1.0, key="gw")
     water_table_at_ground = st.checkbox("water_table_at_ground", value=True, key="wt")
-    consol_method = st.selectbox("consol_method", ["mv", "Cc"], index=0, key="cm")
+    use_flood_wt = st.checkbox("Use 10-year flood level as water level (54 m AOD)", value=True)
+    z_wt_m = st.number_input("z_wt_m (m below ground)", value=0.0, min_value=0.0, step=0.1, key="zw", help="Water table depth below ground. If WT at ground, set 0.")
+    consol_method = st.selectbox(
+        "Primary consolidation settlement model",
+        ["mv", "Cc"],
+        index=0,
+        key="cm",
+        format_func=lambda v: "mv (given)" if v == "mv" else "Cc/log10 (normally consolidated)",
+    )
     m_v = st.number_input("m_v (m²/kN)", value=0.0005, format="%.6f", step=0.0001, key="mv")
     Cc = st.number_input("Cc", value=0.35, step=0.05, key="Cc")
     e0 = st.number_input("e0", value=0.335, step=0.01, key="e0")
@@ -1294,16 +1496,31 @@ df1 = key_df = report_df = summary_df = None
 week2_chainage_df = None
 out_path = None
 layers_df_for_x_section = None
-baseline_vs_layered_summary = []
+layer_table_x0 = None
+settlement_summary = []
 neg_dsigma_chainages = []
+monotonic_warnings = []
 slope_stab_result = None
+csv_paths = {}
+x0_summary = None
 
 if run_btn:
     with st.spinner("Calculating..."):
-        df1, key_df, report_df, summary_df, layers_df_for_x_section, baseline_vs_layered_summary, neg_dsigma_chainages = week1_calculate()
+        (
+            df1,
+            key_df,
+            report_df,
+            summary_df,
+            layers_df_for_x_section,
+            settlement_summary,
+            neg_dsigma_chainages,
+            layer_table_x0,
+            monotonic_warnings,
+        ) = week1_calculate()
         out_path = export_week1_excel(df1, key_df, report_df, summary_df, layers_df_for_x_section)
         week2_chainage_df = week2_run(df1)
         out_path = export_add_week2_sheets(out_path, week2_chainage_df)
+        csv_paths = export_additional_csvs(df1, week2_chainage_df, layer_table_x0)
         if run_slope_stability and df1 is not None:
             slope_stab_result = slope_stability_grid_search(
                 df1, x_stability, grid_x_min, grid_x_max, grid_z_min, grid_z_max,
@@ -1314,7 +1531,11 @@ if run_btn:
                 domain_mode="half" if is_half_domain else "full", side=stability_side, tol=intersection_tolerance,
                 require_pass_through_embankment=require_pass_through_embankment if is_half_domain else False,
                 max_cover_height=max_cover_height if is_half_domain else 2.0)
-    st.success("Done. Excel saved to " + str(out_path))
+        x0_summary = summarize_x0_settlement_and_consolidation(layer_table_x0, week2_chainage_df)
+    csv_note = ""
+    if csv_paths:
+        csv_note = " | CSV: " + ", ".join([os.path.basename(p) for p in csv_paths.values()])
+    st.success("Done. Excel saved to " + str(out_path) + csv_note)
 
 if df1 is not None:
     # -------------------------------------------------------------------------
@@ -1377,7 +1598,8 @@ if df1 is not None:
     ax2.axhline(bedrock_lev, color="sienna", ls="--", lw=1.5, label="bedrock")
     ax2.fill_between([-half_w, half_w], bedrock_lev, ground_lev, color="sienna", alpha=0.2)
     if layers_df_for_x_section is not None and len(layers_df_for_x_section) > 0:
-        dz_sec = float(layers_df_for_x_section.iloc[0]["dz (m)"])
+        dz_col = "dz_m" if "dz_m" in layers_df_for_x_section.columns else "dz (m)"
+        dz_sec = float(layers_df_for_x_section.iloc[0][dz_col])
         N_sec = len(layers_df_for_x_section)
         for i in range(N_sec):
             z_top = i * dz_sec
@@ -1467,6 +1689,8 @@ if df1 is not None:
     # 3) Settlement Results
     # -------------------------------------------------------------------------
     st.header("Settlement Results")
+    if monotonic_warnings:
+        st.warning("Settlement should increase with higher fill; monotonicity failed for some cases (see Detailed tables).")
     c_s1, c_s2 = st.columns(2)
     with c_s1:
         st.metric("Max ρ_i (m)", f"{df1['rho_i'].max():.4f}")
@@ -1475,19 +1699,146 @@ if df1 is not None:
         st.metric("Max Z_construct (mAOD)", f"{df1['Z_rev'].max():.3f}")
     with c_s2:
         st.caption("Longitudinal profile (ρ, Z_construct) shown in Geometry section.")
-    with st.expander("Layered consolidation table at x_section", expanded=False):
+    with st.expander("Settlement integration table at x_section (slices)", expanded=False):
         if layers_df_for_x_section is not None:
             st.dataframe(layers_df_for_x_section, use_container_width=True, hide_index=True)
         else:
-            st.info("Layered mode not selected. Layers table only shown for 'Layered (sum over N layers)'.")
+            st.info("No settlement slices available (H0<=0 or settlement not computed at this chainage).")
+
+    st.subheader("Method cross-check (x_section)")
+    if H0_sec > 0.0 and float(r["q_equiv"]) > 0.0:
+        q_sec = float(r["q_equiv"])
+        x_sec_val = float(r["x"])
+        n_slices_cross = int(len(layers_df_for_x_section)) if layers_df_for_x_section is not None and len(layers_df_for_x_section) > 0 else 60
+        dz_cross = H0_sec / float(n_slices_cross)
+
+        if use_flood_wt:
+            z_wt_cross = max(0.0, ground_lev - FLOOD_10YR_AOD_M)
+        else:
+            z_wt_cross = 0.0 if water_table_at_ground else float(z_wt_m)
+        stress_cross = StressInputs(
+            gamma_unsat_kN_m3=float(gamma_clay),
+            gamma_sat_kN_m3=float(gamma_clay),
+            gamma_w_kN_m3=float(gamma_w),
+            z_wt_m=float(z_wt_cross),
+        )
+        # Assumption: same Δσ(z) model as current workflow (uniform with depth).
+        delta_sigma_func_cross = lambda z, qval=q_sec: float(qval)
+
+        if layers_df_for_x_section is not None and len(layers_df_for_x_section) > 0 and "s_cum_m" in layers_df_for_x_section.columns:
+            S_Cc_slices = float(layers_df_for_x_section["s_cum_m"].iloc[-1])
+        else:
+            S_Cc_slices = float(r["rho_c"])
+        z_mid_cross = 0.5 * H0_sec
+        sigma0_mid_cross = sigma_v0_prime_kpa(z_mid_cross, stress_cross)
+        delta_sigma_mid_cross = float(delta_sigma_func_cross(z_mid_cross))
+        ratio_mid_cross = (sigma0_mid_cross + delta_sigma_mid_cross) / max(1e-3, sigma0_mid_cross)
+        S_Cc_mid = (float(Cc) / (1.0 + float(e0))) * H0_sec * math.log10(ratio_mid_cross)
+
+        mv_table = build_settlement_integration_table_mv(
+            H0=H0_sec,
+            m_v=float(m_v),
+            delta_sigma_func=delta_sigma_func_cross,
+            stress=stress_cross,
+            n_slices=n_slices_cross,
+        )
+        S_mv_slices = float(mv_table["S_total_m"])
+        # Assumption: mv is constant with depth for this simplified coursework model.
+        S_mv_mid = float(m_v) * delta_sigma_mid_cross * H0_sec
+
+        def _pct_diff(slice_val: float, mid_val: float) -> float:
+            denom = max(abs(slice_val), 1e-12)
+            return 100.0 * abs(mid_val - slice_val) / denom
+
+        pct_cc_slice_mid = _pct_diff(S_Cc_slices, S_Cc_mid)
+        pct_mv_slice_mid = _pct_diff(S_mv_slices, S_mv_mid)
+        pct_cc_vs_mv_slices = _pct_diff(S_Cc_slices, S_mv_slices)
+
+        st.markdown(
+            f"Nearest computed chainage: **x={x_sec_val:.1f} m**  \n"
+            f"Slice size: **dz = H0/N = {H0_sec:.3f}/{n_slices_cross} = {dz_cross:.4f} m**  \n"
+            f"Δσ(H0/2): **{delta_sigma_mid_cross:.3f} kPa** | σ′v0(H0/2): **{sigma0_mid_cross:.3f} kPa**"
+        )
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            st.metric("S_Cc_slices", f"{S_Cc_slices:.4f} m ({S_Cc_slices * 1000.0:.1f} mm)")
+            st.metric("S_Cc_mid", f"{S_Cc_mid:.4f} m ({S_Cc_mid * 1000.0:.1f} mm)")
+            st.metric("Cc slice vs mid", f"{pct_cc_slice_mid:.2f}%")
+        with cc2:
+            st.metric("S_mv_slices", f"{S_mv_slices:.4f} m ({S_mv_slices * 1000.0:.1f} mm)")
+            st.metric("S_mv_mid", f"{S_mv_mid:.4f} m ({S_mv_mid * 1000.0:.1f} mm)")
+            st.metric("mv slice vs mid", f"{pct_mv_slice_mid:.2f}%")
+        st.metric("Cc_slices vs mv_slices (method sensitivity)", f"{pct_cc_vs_mv_slices:.2f}%")
+        st.caption("Cross-check shows both methods; they are different constitutive assumptions so results need not match.")
+    else:
+        st.info("Method cross-check unavailable at this x_section (requires H0>0 and q_equiv>0).")
+
+    st.subheader("x=0 summary (depth slices → evidence)")
+    if x0_summary and x0_summary.get("ok"):
+        hd_txt = f"{x0_summary.get('Hd_m', float('nan')):.3f} m" if x0_summary.get("Hd_m") is not None else "—"
+        t20_txt = f"{x0_summary.get('U20_t_years', float('nan')):.3f} yrs" if x0_summary.get("U20_t_years") is not None else "—"
+        t50_txt = f"{x0_summary.get('U50_t_years', float('nan')):.3f} yrs" if x0_summary.get("U50_t_years") is not None else "—"
+        t90_txt = f"{x0_summary.get('U90_t_years', float('nan')):.3f} yrs" if x0_summary.get("U90_t_years") is not None else "—"
+        c_x0_1, c_x0_2 = st.columns(2)
+        with c_x0_1:
+            st.markdown(
+                f"σ′v0(z) min/max: **{x0_summary['sigma_v0_prime_min_kpa']:.3f} / {x0_summary['sigma_v0_prime_max_kpa']:.3f} kPa**  \n"
+                f"Δσ(z) min/max: **{x0_summary['delta_sigma_min_kpa']:.3f} / {x0_summary['delta_sigma_max_kpa']:.3f} kPa**  \n"
+                f"ds(z) min/max: **{x0_summary['ds_min_m']:.4f} / {x0_summary['ds_max_m']:.4f} m**  \n"
+                f"Max ds at z_mid={x0_summary['ds_max_z_mid_m']:.3f} m "
+                f"(σ′v0={x0_summary['ds_max_sigma_v0_prime_kpa']:.3f} kPa, Δσ={x0_summary['ds_max_delta_sigma_kpa']:.3f} kPa)"
+            )
+        with c_x0_2:
+            st.markdown(
+                f"S_primary(x=0): **{x0_summary['S_primary_m']:.4f} m ({x0_summary['S_primary_mm']:.1f} mm)**  \n"
+                f"Hd (drainage path): **{hd_txt}**  \n"
+                f"t20 / t50 / t90: **{t20_txt} / {t50_txt} / {t90_txt}**"
+            )
+    elif x0_summary and not x0_summary.get("ok"):
+        st.info(f"x=0 summary unavailable: {x0_summary.get('reason', 'unknown issue')}")
+    else:
+        st.info("Run calculations to populate x=0 settlement/consolidation summary.")
+
+    show_debug = st.checkbox("Show debug checks", value=False)
+    if show_debug:
+        with st.expander("Debug (optional): x=0 audit check", expanded=False):
+            if df1 is not None and len(df1) > 0 and layer_table_x0 is not None and len(layer_table_x0) > 0:
+                idx_x0 = (df1["x"] - 0.0).abs().idxmin()
+                r0 = df1.loc[idx_x0]
+                H0_x0 = float(r0["H0"])
+                z_mid = 0.5 * H0_x0
+                if use_flood_wt:
+                    z_wt_val_ui = max(0.0, float(r0["ground level"]) - FLOOD_10YR_AOD_M)
+                else:
+                    z_wt_val_ui = 0.0 if water_table_at_ground else float(z_wt_m)
+                if z_mid <= z_wt_val_ui:
+                    sigma_v_mid = float(gamma_clay) * z_mid
+                    u_mid = 0.0
+                else:
+                    sigma_v_mid = float(gamma_clay) * z_wt_val_ui + float(gamma_clay) * (z_mid - z_wt_val_ui)
+                    u_mid = float(gamma_w) * (z_mid - z_wt_val_ui)
+                sigma_v0_mid = max(sigma_v_mid - u_mid, 1e-3)
+                st.markdown(
+                    f"**x=0 mid-depth (z=H0/2):** H0={H0_x0:.3f} m, z_mid={z_mid:.3f} m  \n"
+                    f"σv={sigma_v_mid:.3f} kPa, u={u_mid:.3f} kPa → σ′v0={sigma_v0_mid:.3f} kPa"
+                )
+                st.caption("Slice preview (first 5 rows) from settlement integration table at x≈0.")
+                st.dataframe(layer_table_x0.head(5), use_container_width=True, hide_index=True)
+            else:
+                st.info("No settlement integration table available at x=0 (check H0 and inputs).")
     with st.expander("Formulas used", expanded=False):
         st.latex(r"E_u = (E_u/c_u) \cdot c_u")
         st.latex(r"\rho_i = \frac{q \cdot B \cdot I_s}{E_u}\quad \text{(B = B\_base)}")
-        st.markdown(r"**m_v:** $\rho_c = \sum \left( m_v \cdot \Delta\sigma(z_i) \cdot dz \right)$ (layered) or $\rho_c = m_v \cdot \Delta\sigma(z=H_0/2) \cdot H_0$ (baseline)")
-        st.markdown(r"**C_c:** $\rho_c = \sum \frac{dz}{1+e_0} \cdot C_c \cdot \log_{10}\frac{\sigma'_{v0}+\Delta\sigma}{\sigma'_{v0}}$")
-        st.latex(r"\rho_{\text{total}} = \rho_i + \rho_c")
+        st.latex(r"\sigma_v(z)=\gamma_{\text{unsat}}z\ (z\le z_{wt});\ \sigma_v=\gamma_{\text{unsat}}z_{wt}+\gamma_{\text{sat}}(z-z_{wt})\ (z>z_{wt})")
+        st.latex(r"u(z)=0\ (z\le z_{wt});\ u=\gamma_w(z-z_{wt})\ (z>z_{wt});\ \sigma'_{v0}=\max(\sigma_v-u,10^{-3}\text{ kPa})")
+        st.markdown(r"**Δσ assumption:** Δσ(z)=q_equiv (constant with depth; wide embankment preliminary model)")
+        st.markdown(r"**Terzaghi 1D (log10):** $ds=\frac{C_c}{1+e_0}dz\log_{10}\frac{\sigma'_{v0}+\Delta\sigma}{\sigma'_{v0}},\ S=\sum ds$")
+        st.latex(r"\rho_{\text{total}} = \rho_i + S")
         st.latex(r"Z_{\text{construct}} = Z_{\text{finish}} + \rho_{\text{total}}")
     st.caption("**Values carried forward →** rho_total used for Z_construct and construction cross-section")
+    st.markdown("**Evidence notes:**")
+    for note in EVIDENCE_NOTES:
+        st.caption(note)
 
     # -------------------------------------------------------------------------
     # 4) Consolidation Time (Vertical)
@@ -1495,10 +1846,11 @@ if df1 is not None:
     st.header("Consolidation Time (Vertical)")
     st.dataframe(week2_chainage_df, use_container_width=True, hide_index=True)
     with st.expander("Formulas used", expanded=False):
-        st.latex(r"T_v = \frac{C_v \, t}{d^2} \implies t = \frac{T_v \, d^2}{C_v}")
-        st.markdown(r"**Tv(Uv) piecewise:** if Uv < 0.60 then $T_v = (\pi/4)U_v^2$; else $T_v = 1.781 - 0.933\log_{10}(100-100U_v)$")
-        st.latex(r"d = H_0/2 \text{ (double)} \quad \text{or} \quad d = H_0 \text{ (single)}")
-    st.caption("**Values carried forward →** t and Uv for vertical consolidation")
+        st.latex(r"T_v = \frac{C_v \, t}{H_d^2} \implies t = \frac{T_v \, H_d^2}{C_v}")
+        st.markdown(r"**U(T_v) series:** $U = 1 - \sum_{n=0}^{\infty}\frac{8}{\pi^2(2n+1)^2}e^{-(2n+1)^2\pi^2 T_v/4}$")
+        st.caption("Tv(U) solved by bisection (80-term truncation).")
+        st.latex(r"H_d = H_0 \text{ (single drainage)} \quad \text{or} \quad H_d = H_0/2 \text{ (double drainage)}")
+    st.caption("**Values carried forward →** Tv and t_years for U20/U50/U90")
 
     # -------------------------------------------------------------------------
     # 5) Slope Stability (Short-term Undrained)
@@ -1783,10 +2135,13 @@ if df1 is not None:
             top10_slope_df = pd.DataFrame(sorted_res).rename(columns={"fos": "FOS"})
             st.markdown("**Slope top10 df**")
             st.dataframe(top10_slope_df, use_container_width=True, hide_index=True)
-        val_df = pd.DataFrame(baseline_vs_layered_summary)
-        val_df = val_df.rename(columns={"rho_c_baseline": "rho_c_baseline (single)", "rho_c_chosen": "rho_c_chosen", "pct_diff": "% diff"})
-        st.markdown("**Validation (baseline vs layered)**")
+        val_df = pd.DataFrame(settlement_summary)
+        st.markdown("**Settlement summary (key chainages)**")
         st.dataframe(val_df, use_container_width=True, hide_index=True)
+        if monotonic_warnings:
+            warn_df = pd.DataFrame(monotonic_warnings)
+            st.warning("Non-monotonic settlement vs load detected (H_fill ↑ but ρ_c ↓). See table below.")
+            st.dataframe(warn_df, use_container_width=True, hide_index=True)
 
 else:
     st.info("Click **Run calculations** in the sidebar to run.")
