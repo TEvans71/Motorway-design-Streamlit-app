@@ -25,6 +25,8 @@ from geotech_core_settlement import (
     sigma_v0_prime_kpa,
 )
 
+APP_BUILD = "9bd2a5e"  # update this when you deploy
+
 # =============================================================================
 # 1) DEFAULT INPUTS — WEEK 1 (overwritten by sidebar on Run)
 # =============================================================================
@@ -244,6 +246,7 @@ def _format_locked_value(item: dict) -> str:
 
 def render_project_inputs_locked(coursework_inputs: dict):
     st.sidebar.header("Project Inputs")
+    st.sidebar.caption(f"Build: {APP_BUILD}")
     for section_name, items in coursework_inputs.items():
         st.sidebar.subheader(section_name)
         rows = [
@@ -2976,4 +2979,4 @@ if df1 is not None:
 else:
     st.info("Click **Run calculations** in the sidebar to run.")
 
-st.caption("Build stamp: slope-stability-graphics-v1")
+st.caption(f"Build: {APP_BUILD}")
