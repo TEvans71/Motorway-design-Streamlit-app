@@ -25,7 +25,7 @@ from geotech_core_settlement import (
     sigma_v0_prime_kpa,
 )
 
-APP_BUILD = "1f51962"  # update this when you deploy
+APP_BUILD = "23c269b"  # update this when you deploy
 
 # =============================================================================
 # 1) DEFAULT INPUTS — WEEK 1 (overwritten by sidebar on Run)
