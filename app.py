@@ -7,7 +7,6 @@ EN3309 Week 1 + Week 2 (Ted's Spyder logic merged). All maths unchanged.
 
 import os
 import math
-import shutil
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Callable, Optional
@@ -44,7 +43,6 @@ APP_BUILD = "90d3aa6"  # update this when you deploy
 # =============================================================================
 
 OUTPUT_FOLDER = "out_motorway"
-OUTPUT_EXCEL_NAME = "Motorway_Week1.xlsx"
 
 # Group defaults for Reset button
 GROUP_DEFAULTS = {
@@ -146,7 +144,7 @@ EVIDENCE_NOTES = [
     "H_fill(x) = max(0, Z_finish(x) − Z_ground(x))",
     "z_wt(x) = max(0, Z_ground(x) − 54)",
     "σ′v0(z) = σv(z) − u(z)",
-    "ds=(Cc/(1+e0)) dz log10((σ′0+Δσ)/σ′0)",
+    "ds = (C_c/(1+e_0)) log10((σ′₀+Δσ)/σ′₀) dz",
     "Tv=Cv t/Hd²; Hd=H0 or H0/2",
 ]
 FLOOD_10YR_AOD_M = 54.0
@@ -332,6 +330,45 @@ def W_line_kN_per_m(H_fill: float, B_base: float) -> float:
 def q_equiv_kPa(H_fill: float, B_base: float) -> float:
     B = max(1e-9, float(B_base))
     return W_line_kN_per_m(H_fill, B_base) / B
+
+
+def compute_immediate_settlement_df(
+    df: pd.DataFrame,
+    gamma_fill_kN_m3: float,
+    cu_kpa: float,
+    eu_over_cu: float,
+    mu0: float,
+    mu1: float,
+    H_fill_col: str,
+    B_base_col: str,
+) -> pd.DataFrame:
+    """
+    Append undrained elastic immediate-settlement columns.
+
+    Craig/Barnes form:
+        rho_i = mu0 * mu1 * (q * B / Eu)
+        q = gamma_fill * H_fill
+        Eu = (Eu_over_Cu) * Cu
+    """
+    out = df.copy()
+    if H_fill_col not in out.columns or B_base_col not in out.columns:
+        raise KeyError(f"Required columns missing: {H_fill_col}, {B_base_col}")
+
+    h_fill_vals = out[H_fill_col].astype(float)
+    b_base_vals = out[B_base_col].astype(float)
+    q_kpa = float(gamma_fill_kN_m3) * h_fill_vals
+    eu_kpa = float(eu_over_cu) * float(cu_kpa)
+    if eu_kpa <= 0.0:
+        raise ValueError("Eu must be > 0 for immediate settlement.")
+
+    rho_i_m = float(mu0) * float(mu1) * ((q_kpa * b_base_vals) / float(eu_kpa))
+    out["rho_i_m"] = rho_i_m.astype(float)
+    out["q_kpa_immediate"] = q_kpa.astype(float)
+    out["Eu_kpa_immediate"] = float(eu_kpa)
+    out["mu0_immediate"] = float(mu0)
+    out["mu1_immediate"] = float(mu1)
+    return out
+
 
 def strip_angles_alpha_beta(B: float, z: float, x: float = 0.0):
     if z <= 0.0:
@@ -759,6 +796,7 @@ def week1_calculate():
         eps = 0.05  # 5% load bump (small enough to be "local")
         q_base = float(q)  # q_equiv_kpa at this chainage
         S_base = float(S_cc_center_m)
+        rho_total_base = float(rho_i_x) + float(S_base)
         if use_craig_delta_sigma:
             S_plus_func = (
                 lambda z, qval=q_base * (1.0 + eps), Bval=float(B):
@@ -775,15 +813,19 @@ def week1_calculate():
             n_slices=60,
             log_base=10,
         )
+        rho_i_plus = float(rho_i_x)
+        if Eu_kpa > 0.0 and q_kpa > 0.0:
+            rho_i_plus = (float(q_kpa) * (1.0 + eps) * float(B) * float(Is_x)) / float(Eu_kpa)
+        rho_total_plus = float(rho_i_plus) + float(S_plus_m)
         tol = 1e-9
-        if S_plus_m + tol < S_base:
+        if rho_total_plus + tol < rho_total_base:
             monotonic_warnings.append({
                 "x": float(x_val),
                 "q_equiv_kpa": q_base,
-                "S_base_m": S_base,
+                "rho_total_base_m": rho_total_base,
                 "q_plus_kpa": q_base * (1.0 + eps),
-                "S_plus_m": float(S_plus_m),
-                "message": "Local monotonicity failed: load increased at same chainage but settlement decreased. Check σ′0/Δσ/log handling.",
+                "rho_total_plus_m": float(rho_total_plus),
+                "message": "Local monotonicity failed: load increased at same chainage but total settlement decreased. Check immediate + consolidation wiring.",
             })
 
         rho_c.append(rho_c_x)
@@ -796,19 +838,23 @@ def week1_calculate():
         else:
             rho_c_method_list.append("mv slices (Δσ=q center+edge)" if consol_method_value == "mv" else "Cc slices (Δσ=q center+edge)")
 
-    rho = [float(v) for v in rho_total_center_list]
+    rho_i_m = [float(v) for v in rho_i]
+    rho_c_m = [float(v) for v in rho_c]
+    rho_total_m = [float(ri) + float(rc) for ri, rc in zip(rho_i_m, rho_c_m)]
+    rho = [float(v) for v in rho_total_m]
     rho_total_center = [float(v) for v in rho_total_center_list]
     rho_total_edge = [float(v) for v in rho_total_edge_list]
     delta_rho_total_edge_minus_center = [
         float(re - rc) for re, rc in zip(rho_total_edge_list, rho_total_center_list)
     ]
-    Z_rev = [zf + r for zf, r in zip(Z_finish, rho)]
+    Z_rev = [zf + r for zf, r in zip(Z_finish, rho_total_m)]
     df = pd.DataFrame({
         "x": chainages, "ground level": ground, "bedrock level": bedrock, "H0": H0_list,
         "Z_finish": Z_finish, "H_fill": H_fill, "B_base": B_base, "A_trap": Atrap,
         "W_line": Wline, "q_equiv": qeq, "q_immediate": q_immediate, "Is_immediate": Is_immediate,
         "Eu_kpa": Eu_immediate, "rho_i": rho_i, "Delta_sigma_mid": Delta_sigma_mid,
         "rho_c": rho_c, "rho": rho, "Z_rev": Z_rev,
+        "rho_i_m": rho_i_m, "rho_c_m": rho_c_m, "rho_total_m": rho_total_m,
         "rho_c_center_m": rho_c_center_list, "rho_c_edge_m": rho_c_edge_list,
         "rho_total_center_m": rho_total_center, "rho_total_edge_m": rho_total_edge,
         "delta_rho_total_edge_minus_center_m": delta_rho_total_edge_minus_center,
@@ -870,7 +916,7 @@ def week1_calculate():
     add_row("Mid", (df["x"] - 500.0).abs().idxmin())
     add_row("B (end)", df.index[-1])
     add_row("Max fill height", df["H_fill"].idxmax())
-    add_row("Max total settlement", df["rho"].idxmax())
+    add_row("Max total settlement", df["rho_total_m"].idxmax())
     add_row("Min clay thickness (H0)", df["H0"].idxmin())
     key_df = pd.DataFrame(key_rows)
     idx_w = (df["x"] - float(x_worked)).abs().idxmin()
@@ -923,14 +969,14 @@ def week1_calculate():
         report.append(f"  Δσ = {delta_sigma_mid:.3f} kPa")
     report.append("")
     report.append("Primary consolidation (Terzaghi 1D, log10)")
-    report.append("  ds = (Cc/(1+e0)) dz log10((σ′0+Δσ)/σ′0)")
+    report.append("  ds = (C_c/(1+e_0)) log10((σ′₀+Δσ)/σ′₀) dz")
     report.append(f"  ρ_c (sum over slices) = {float(rw['rho_c']):.3f} m")
     report.append("")
     report.append("Total settlement and revised level")
-    report.append("  ρ = ρ_i + ρ_c")
-    report.append(f"  = {float(rw['rho_i']):.3f} + {float(rw['rho_c']):.3f} = {float(rw['rho']):.3f} m")
+    report.append("  ρ_total = ρ_i + ρ_c")
+    report.append(f"  = {float(rw['rho_i_m']):.3f} + {float(rw['rho_c_m']):.3f} = {float(rw['rho_total_m']):.3f} m")
     report.append("  Z_rev = Z_finish + ρ")
-    report.append(f"  = {float(rw['Z_finish']):.3f} + {float(rw['rho']):.3f} = {float(rw['Z_rev']):.3f} mAOD")
+    report.append(f"  = {float(rw['Z_finish']):.3f} + {float(rw['rho_total_m']):.3f} = {float(rw['Z_rev']):.3f} mAOD")
     report_df = pd.DataFrame({"text": report})
     summary = []
     summary.append("WEEK 1 SUMMARY")
@@ -938,9 +984,9 @@ def week1_calculate():
     summary.append("Finished level constraint: Z_finish(x)=max(Z_design(x), 55.0 m AOD) using 10-year flood level 54.0 m AOD + 1 m freeboard.")
     summary.append("WT depth for σ′v0 computed from AOD: z_wt(x)=max(0, Z_ground(x)−54.0).")
     summary.append(f"Max H_fill = {df['H_fill'].max():.3f} m")
-    summary.append(f"Max ρ total = {df['rho'].max():.3f} m")
-    summary.append(f"Max ρ_i = {df['rho_i'].max():.3f} m")
-    summary.append(f"Max ρ_c = {df['rho_c'].max():.3f} m")
+    summary.append(f"Max ρ_total = {df['rho_total_m'].max():.3f} m")
+    summary.append(f"Max ρ_i = {df['rho_i_m'].max():.3f} m")
+    summary.append(f"Max ρ_c = {df['rho_c_m'].max():.3f} m")
     summary_df = pd.DataFrame({"text": summary})
 
     if run_preliminary_quick_stage:
@@ -1060,6 +1106,10 @@ def week1_calculate():
         raise ValueError("Non-finite consolidation settlement encountered.")
     if len(rho_c) > 0 and min(rho_c) < 0:
         raise ValueError("Negative consolidation settlement encountered.")
+    if any(not np.isfinite(val) for val in rho_total_m):
+        raise ValueError("Non-finite total settlement encountered.")
+    if len(rho_total_m) > 0 and min(rho_total_m) < 0:
+        raise ValueError("Negative total settlement encountered.")
     if sigma_v0_prime_mins and min(sigma_v0_prime_mins) <= 0:
         raise ValueError("σ′v0 <= 0 detected; check stress model inputs.")
 
@@ -1099,71 +1149,7 @@ def week1_calculate():
 
 
 # =============================================================================
-# 4) EXPORT WEEK 1
-# =============================================================================
-
-def export_week1_excel(df, key_df, report_df, summary_df, layers_df_for_x_section=None, immediate_stage_df_x_section=None):
-    ensure_dir(OUTPUT_FOLDER)
-    base_path = os.path.join(OUTPUT_FOLDER, OUTPUT_EXCEL_NAME)
-    out_path = base_path
-    if os.path.exists(base_path):
-        try:
-            with open(base_path, "a"):
-                pass
-        except PermissionError:
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            name, ext = os.path.splitext(OUTPUT_EXCEL_NAME)
-            out_path = os.path.join(OUTPUT_FOLDER, f"{name}_{stamp}{ext}")
-    inputs = {
-        "L": L, "dx": dx, "ground_A": ground_A, "ground_B": ground_B,
-        "bedrock_c": bedrock_c, "x_c": x_c, "bedrock_goes_down_towards_B": bedrock_goes_down_towards_B,
-        "B_top": B_top, "m": m, "flood_level": flood_level, "freeboard": freeboard,
-        "Zmin_finish": Zmin_finish, "Z_peak_finish": Z_peak_finish, "grade": grade,
-        "gamma_fill": gamma_fill, "gamma_clay": gamma_clay, "gamma_w": gamma_w,
-        "water_table_at_ground": water_table_at_ground, "cu": cu, "Is": Is, "Eu_over_cu": Eu_over_cu,
-        "immediate_settlement_method": immediate_settlement_method,
-        "q_immediate_method": q_immediate_method,
-        "influence_factor_input_mode": influence_factor_input_mode,
-        "I_s_input": I_s_input,
-        "mu1_input": mu1_input,
-        "staged_construction_lifts": staged_construction_lifts,
-        "lift_height_m": lift_height_m,
-        "consol_method": consol_method, "m_v": m_v, "Cc": Cc, "e0": e0, "x_worked": x_worked,
-        "consolidation_depth_method": consolidation_depth_method,
-        "N_layers": N_layers,
-        "consol_stress_point": consol_stress_point,
-        "delta_sigma_mode": delta_sigma_mode,
-        "run_preliminary_quick_stage": run_preliminary_quick_stage,
-        "run_detailed_stage2_profile": run_detailed_stage2_profile,
-        "Uv_targets": str(Uv_targets), "Cv_m2_per_s": Cv_m2_per_s,
-        "vertical_drainage": vertical_drainage,
-    }
-    inputs_df = pd.DataFrame([inputs]).T.reset_index()
-    inputs_df.columns = ["input", "value"]
-    report_all = pd.concat([report_df, pd.DataFrame({"text": ["", "----------------", ""]}), summary_df], ignore_index=True)
-    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
-        inputs_df.to_excel(writer, sheet_name="Inputs", index=False)
-        df.to_excel(writer, sheet_name="Week1_Chainage", index=False)
-        key_df.to_excel(writer, sheet_name="Week1_KeySections", index=False)
-        report_all.to_excel(writer, sheet_name="Week1_Report", index=False)
-        if layers_df_for_x_section is not None and len(layers_df_for_x_section) > 0:
-            layers_df_for_x_section.to_excel(writer, sheet_name="Week1_ConsolLayers_xSection", index=False)
-        else:
-            note_df = pd.DataFrame([{"note": "Layered mode not used. Consolidation layers sheet applies only to Layered depth method."}])
-            note_df.to_excel(writer, sheet_name="Week1_ConsolLayers_xSection", index=False)
-        if immediate_stage_df_x_section is not None and len(immediate_stage_df_x_section) > 0:
-            immediate_stage_df_x_section.to_excel(writer, sheet_name="Week1_ImmediateStages_xSection", index=False)
-        else:
-            note_df_stage = pd.DataFrame([{"note": "Staged immediate settlement not enabled or no fill at x_section."}])
-            note_df_stage.to_excel(writer, sheet_name="Week1_ImmediateStages_xSection", index=False)
-        for name in ["Inputs", "Week1_Chainage", "Week1_KeySections", "Week1_Report", "Week1_ConsolLayers_xSection", "Week1_ImmediateStages_xSection"]:
-            ws = writer.sheets[name]
-            ws.freeze_panes = "B2"
-    return out_path
-
-
-# =============================================================================
-# 5) WEEK 2 FUNCTIONS
+# 4) WEEK 2 FUNCTIONS
 # =============================================================================
 
 def week2_run(df_week1_chainage: pd.DataFrame):
@@ -1337,26 +1323,6 @@ def summarize_x0_settlement_and_consolidation(layer_table_x0: pd.DataFrame, cons
 
     return out
 
-def export_add_week2_sheets(out_path: str, week2_chainage_df: pd.DataFrame) -> str:
-    """Add Week2_ConsolTime (vertical consolidation) sheet to workbook."""
-    if not os.path.exists(out_path):
-        raise FileNotFoundError(f"Cannot find Week 1 workbook: {out_path}")
-    try:
-        with pd.ExcelWriter(out_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
-            week2_chainage_df.to_excel(writer, sheet_name="Week2_ConsolTime", index=False)
-        return out_path
-    except PermissionError:
-        folder = os.path.dirname(out_path) or "."
-        base = os.path.basename(out_path)
-        name, ext = os.path.splitext(base)
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        copy_path = os.path.join(folder, f"{name}_week2_{stamp}{ext}")
-        shutil.copyfile(out_path, copy_path)
-        with pd.ExcelWriter(copy_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
-            week2_chainage_df.to_excel(writer, sheet_name="Week2_ConsolTime", index=False)
-        return copy_path
-
-
 def export_additional_csvs(
     df,
     week2_chainage_df,
@@ -1376,6 +1342,9 @@ def export_additional_csvs(
             "x_m": df["x"],
             "S_primary_m": df["rho_c"],
             "S_primary_mm": df["rho_c"] * 1000.0,
+            "rho_i_m": df["rho_i_m"],
+            "rho_c_m": df["rho_c_m"],
+            "rho_total_m": df["rho_total_m"],
             "rho_c_center_m": df["rho_c_center_m"],
             "rho_c_edge_m": df["rho_c_edge_m"],
             "rho_total_center_m": df["rho_total_center_m"],
@@ -1411,7 +1380,7 @@ def export_additional_csvs(
     if df is not None and len(df) > 0:
         z_build_vals = df["Z_rev"]
         z_post_vals = df["Z_finish"]
-        settlement_vals = df["rho"]
+        settlement_vals = df["rho_total_m"]
         note_text = "Z_construct = Z_design + settlement (design as post-settlement target)."
         if (
             run_detailed_stage2_profile
@@ -1439,6 +1408,8 @@ def export_additional_csvs(
         align_df = pd.DataFrame({
             "chainage_m": df["x"],
             "Z_design_mAOD": df["Z_finish"],
+            "rho_i_m": df["rho_i_m"],
+            "rho_total_m": df["rho_total_m"],
             "settlement_total_m": settlement_vals,
             "Z_construct_mAOD": z_build_vals,
             "Z_post_mAOD": z_post_vals,
@@ -2477,7 +2448,7 @@ def slope_stability_grid_search(df1: pd.DataFrame, x_stability: float,
 
 
 # =============================================================================
-# 6) STREAMLIT UI
+# 5) STREAMLIT UI
 # =============================================================================
 
 st.set_page_config(page_title="Motorway Design Coursework", layout="wide")
@@ -2584,6 +2555,49 @@ else:
     st.error("Editable sidebar mode is disabled in this coursework build.")
     st.stop()
 
+def render_immediate_settlement_controls():
+    with st.expander("Immediate settlement (undrained elastic)", expanded=False):
+        st.markdown("**Assumptions (lecture-consistent):**")
+        st.markdown("- α = 0 (embankment)")
+        st.markdown("- L/B = ∞ (plane strain)")
+        st.markdown("- OCR = 1.0 (normally consolidated)")
+        st.markdown("- μ0 = 1 (D/B = 0)")
+        st.markdown("- Eu/Cu = 300 (consistent with PI 30-50)")
+        st.markdown("- PI band = PI 30–50")
+
+        c_ratio_1, c_ratio_2 = st.columns(2)
+        with c_ratio_1:
+            st.text_input(
+                "Representative chainage (x_section)",
+                value=f"{float(x_section):.1f} m",
+                disabled=True,
+            )
+        with c_ratio_2:
+            st.text_input("H/B at x_section", value=f"{float(H_over_B):.3f}", disabled=True)
+
+        st.markdown("**μ₁ (from H/B chart, α=0, L/B=∞):** 1.0")
+        st.markdown("**E_u / C_u (lecture value):** 300")
+        st.markdown("**OCR:** 1.0 (normally consolidated)")
+        st.markdown("**Plasticity Index band:** PI 30–50")
+
+        st.caption(f"Using existing γ_fill = {float(gamma_fill):.2f} kN/m³ and existing c_u = {float(cu):.2f} kPa.")
+
+    with st.expander("Lecture evidence (Immediate settlement)", expanded=False):
+        st.markdown("**Equation used:** ρ_i = μ0 μ1 (q B / E_u)")
+        st.markdown("q = γ_fill * H_fill")
+        st.markdown("E_u = (E_u/C_u) * C_u")
+        st.markdown("μ0 fixed at 1 (D/B=0 coursework assumption)")
+        st.markdown("μ1 fixed at 1.0 from H/B chart using α=0 and L/B=∞")
+        st.markdown("E_u/C_u fixed at 300, OCR fixed at 1.0, PI band fixed at PI 30–50")
+        st.markdown("Total primary settlement used in checks/plots/exports: ρ_total = ρ_i + ρ_c")
+
+
+mu1_immediate_input = 1.0
+mu0_immediate_input = 1.0
+ocr_immediate = 1.0
+eu_over_cu_immediate_input = 300.0
+pi_band_immediate = "PI 30–50"
+
 run_btn = st.sidebar.button("Run calculations", type="primary")
 
 _uv_parse_ok = True
@@ -2607,7 +2621,6 @@ week2_chainage_df = None
 week2_chainage_pvd_df = None
 pvd_design = None
 pvd_design_summary_df = None
-out_path = None
 layers_df_for_x_section = None
 immediate_stage_df_x_section = None
 layer_table_x0 = None
@@ -2632,119 +2645,147 @@ if "main_results_cache" not in st.session_state:
 
 if run_btn:
     with st.spinner("Calculating..."):
-        (
-            df1,
-            key_df,
-            report_df,
-            summary_df,
-            layers_df_for_x_section,
-            settlement_summary,
-            neg_dsigma_chainages,
-            layer_table_x0,
-            immediate_stage_df_x_section,
-            monotonic_warnings,
-            quick_stage_df,
-            no_allow_violations_quick,
-            flood_violations_quick,
-            grade_violations,
-            grade_slopes,
-            detailed_stage2_df,
-            flood_violations_stage2,
-            grade_violations_stage2,
-            grade_slopes_stage2,
-        ) = week1_calculate()
-        out_path = export_week1_excel(
-            df1,
-            key_df,
-            report_df,
-            summary_df,
-            layers_df_for_x_section,
-            immediate_stage_df_x_section,
+        pass
+    (
+        df1,
+        key_df,
+        report_df,
+        summary_df,
+        layers_df_for_x_section,
+        settlement_summary,
+        neg_dsigma_chainages,
+        layer_table_x0,
+        immediate_stage_df_x_section,
+        monotonic_warnings,
+        quick_stage_df,
+        no_allow_violations_quick,
+        flood_violations_quick,
+        grade_violations,
+        grade_slopes,
+        detailed_stage2_df,
+        flood_violations_stage2,
+        grade_violations_stage2,
+        grade_slopes_stage2,
+    ) = week1_calculate()
+    df1 = compute_immediate_settlement_df(
+        df=df1,
+        gamma_fill_kN_m3=float(gamma_fill),
+        cu_kpa=float(cu),
+        eu_over_cu=float(eu_over_cu_immediate_input),
+        mu0=float(mu0_immediate_input),
+        mu1=float(mu1_immediate_input),
+        H_fill_col="H_fill",
+        B_base_col="B_base",
+    )
+    df1["rho_c_m"] = df1["rho_c"].astype(float)
+    df1["rho_total_m"] = df1["rho_c_m"] + df1["rho_i_m"].astype(float)
+    df1["H_over_B_immediate"] = np.where(
+        df1["B_base"].astype(float) > 0.0,
+        df1["H0"].astype(float) / df1["B_base"].astype(float),
+        0.0,
+    )
+    df1["D_over_B_immediate"] = np.where(
+        df1["B_base"].astype(float) > 0.0,
+        0.0,
+        0.0,
+    )
+    df1["D_m_immediate"] = 0.0
+    df1["cu_kpa_immediate"] = float(cu)
+    df1["eu_over_cu_immediate"] = float(eu_over_cu_immediate_input)
+    df1["alpha_immediate"] = 0.0
+    df1["L_over_B_immediate"] = "∞"
+    df1["ocr_immediate"] = float(ocr_immediate)
+    if (not np.isfinite(df1["rho_total_m"].astype(float)).all()) or (df1["rho_total_m"].astype(float) < 0.0).any():
+        raise ValueError("Immediate + consolidation total settlement is invalid.")
+    df1["Z_rev"] = df1["Z_finish"].astype(float) + df1["rho_total_m"].astype(float)
+    if key_df is not None and len(key_df) > 0:
+        _by_x = df1.set_index("x")
+        key_df["rho_i"] = key_df["x"].map(_by_x["rho_i_m"]).astype(float)
+        key_df["rho_c"] = key_df["x"].map(_by_x["rho_c_m"]).astype(float)
+        key_df["rho"] = key_df["x"].map(_by_x["rho_total_m"]).astype(float)
+        key_df["Z_rev"] = key_df["x"].map(_by_x["Z_rev"]).astype(float)
+    pvd_design = sand_drain_design_fixed_point(
+        Ur_target=Ur_target,
+        Ch_m2_per_s=Ch_m2_per_s,
+        t_design_years=t_design_years,
+        rd_m=rd_m,
+    )
+    pvd_design_summary_df = pd.DataFrame([{
+        "pattern": pattern,
+        "Ur_target": float(pvd_design["Ur_target"]),
+        "t_design_years": float(pvd_design["t_design_years"]),
+        "Ch_m2_per_s": float(pvd_design["Ch_m2_per_s"]),
+        "rd_m": float(pvd_design["rd_m"]),
+        "n_final": float(pvd_design["n_final"]),
+        "R_m": float(pvd_design["R_m"]),
+        "De_m": float(pvd_design["De_m"]),
+        "S_m": float(pvd_design["S_m"]),
+        "S_target_m": 3.374,
+        "S_minus_target_m": float(pvd_design["S_m"] - 3.374),
+        "iterations": int(pvd_design["iterations"]),
+        "converged": bool(pvd_design["converged"]),
+    }])
+    week2_chainage_df = week2_run(df1)
+    week2_chainage_pvd_df = week2_run_pvd(df1, pvd_design)
+    csv_paths = export_additional_csvs(
+        df=df1,
+        week2_chainage_df=week2_chainage_df,
+        week2_chainage_pvd_df=week2_chainage_pvd_df,
+        pvd_design_summary_df=pvd_design_summary_df,
+        layer_table_x0=layer_table_x0,
+        quick_stage_df=quick_stage_df,
+        detailed_stage2_df=detailed_stage2_df,
+        run_detailed_stage2_profile=run_detailed_stage2_profile,
+    )
+    if run_slope_stability and df1 is not None:
+        trials_df, trial_details, trial_geom = run_phi0_trials(
+            df1=df1,
+            x_stability=x_stability,
+            B_top=B_top,
+            side=stability_side,
+            gamma_fill=gamma_fill,
+            gamma_clay=gamma_clay,
+            n_slices=int(n_slices),
+            cu_kpa=SLOPE_STABILITY_CU_KPA,
         )
-        pvd_design = sand_drain_design_fixed_point(
-            Ur_target=Ur_target,
-            Ch_m2_per_s=Ch_m2_per_s,
-            t_design_years=t_design_years,
-            rd_m=rd_m,
-        )
-        pvd_design_summary_df = pd.DataFrame([{
-            "pattern": pattern,
-            "Ur_target": float(pvd_design["Ur_target"]),
-            "t_design_years": float(pvd_design["t_design_years"]),
-            "Ch_m2_per_s": float(pvd_design["Ch_m2_per_s"]),
-            "rd_m": float(pvd_design["rd_m"]),
-            "n_final": float(pvd_design["n_final"]),
-            "R_m": float(pvd_design["R_m"]),
-            "De_m": float(pvd_design["De_m"]),
-            "S_m": float(pvd_design["S_m"]),
-            "S_target_m": 3.374,
-            "S_minus_target_m": float(pvd_design["S_m"] - 3.374),
-            "iterations": int(pvd_design["iterations"]),
-            "converged": bool(pvd_design["converged"]),
-        }])
-        week2_chainage_df = week2_run(df1)
-        week2_chainage_pvd_df = week2_run_pvd(df1, pvd_design)
-        out_path = export_add_week2_sheets(out_path, week2_chainage_df)
-        csv_paths = export_additional_csvs(
-            df=df1,
-            week2_chainage_df=week2_chainage_df,
-            week2_chainage_pvd_df=week2_chainage_pvd_df,
-            pvd_design_summary_df=pvd_design_summary_df,
-            layer_table_x0=layer_table_x0,
-            quick_stage_df=quick_stage_df,
-            detailed_stage2_df=detailed_stage2_df,
-            run_detailed_stage2_profile=run_detailed_stage2_profile,
-        )
-        if run_slope_stability and df1 is not None:
-            trials_df, trial_details, trial_geom = run_phi0_trials(
-                df1=df1,
-                x_stability=x_stability,
-                B_top=B_top,
-                side=stability_side,
-                gamma_fill=gamma_fill,
-                gamma_clay=gamma_clay,
-                n_slices=int(n_slices),
-                cu_kpa=SLOPE_STABILITY_CU_KPA,
-            )
-            slope_stab_result = {
-                "trials_df": trials_df,
-                "trial_details": trial_details,
-                "geometry": trial_geom,
-            }
-        x0_summary = summarize_x0_settlement_and_consolidation(layer_table_x0, week2_chainage_df)
-        st.session_state["main_results_cache"] = {
-            "df1": df1,
-            "key_df": key_df,
-            "report_df": report_df,
-            "summary_df": summary_df,
-            "week2_chainage_df": week2_chainage_df,
-            "week2_chainage_pvd_df": week2_chainage_pvd_df,
-            "pvd_design": pvd_design,
-            "pvd_design_summary_df": pvd_design_summary_df,
-            "out_path": out_path,
-            "layers_df_for_x_section": layers_df_for_x_section,
-            "immediate_stage_df_x_section": immediate_stage_df_x_section,
-            "layer_table_x0": layer_table_x0,
-            "settlement_summary": settlement_summary,
-            "neg_dsigma_chainages": neg_dsigma_chainages,
-            "monotonic_warnings": monotonic_warnings,
-            "quick_stage_df": quick_stage_df,
-            "no_allow_violations_quick": no_allow_violations_quick,
-            "flood_violations_quick": flood_violations_quick,
-            "grade_violations": grade_violations,
-            "grade_slopes": grade_slopes,
-            "detailed_stage2_df": detailed_stage2_df,
-            "flood_violations_stage2": flood_violations_stage2,
-            "grade_violations_stage2": grade_violations_stage2,
-            "grade_slopes_stage2": grade_slopes_stage2,
-            "slope_stab_result": slope_stab_result,
-            "csv_paths": csv_paths,
-            "x0_summary": x0_summary,
+        slope_stab_result = {
+            "trials_df": trials_df,
+            "trial_details": trial_details,
+            "geometry": trial_geom,
         }
-    csv_note = ""
+    x0_summary = summarize_x0_settlement_and_consolidation(layer_table_x0, week2_chainage_df)
+    st.session_state["main_results_cache"] = {
+        "df1": df1,
+        "key_df": key_df,
+        "report_df": report_df,
+        "summary_df": summary_df,
+        "week2_chainage_df": week2_chainage_df,
+        "week2_chainage_pvd_df": week2_chainage_pvd_df,
+        "pvd_design": pvd_design,
+        "pvd_design_summary_df": pvd_design_summary_df,
+        "layers_df_for_x_section": layers_df_for_x_section,
+        "immediate_stage_df_x_section": immediate_stage_df_x_section,
+        "layer_table_x0": layer_table_x0,
+        "settlement_summary": settlement_summary,
+        "neg_dsigma_chainages": neg_dsigma_chainages,
+        "monotonic_warnings": monotonic_warnings,
+        "quick_stage_df": quick_stage_df,
+        "no_allow_violations_quick": no_allow_violations_quick,
+        "flood_violations_quick": flood_violations_quick,
+        "grade_violations": grade_violations,
+        "grade_slopes": grade_slopes,
+        "detailed_stage2_df": detailed_stage2_df,
+        "flood_violations_stage2": flood_violations_stage2,
+        "grade_violations_stage2": grade_violations_stage2,
+        "grade_slopes_stage2": grade_slopes_stage2,
+        "slope_stab_result": slope_stab_result,
+        "csv_paths": csv_paths,
+        "x0_summary": x0_summary,
+    }
     if csv_paths:
-        csv_note = " | CSV: " + ", ".join([os.path.basename(p) for p in csv_paths.values()])
-    st.success("Done. Excel saved to " + str(out_path) + csv_note)
+        st.success(f"Saved CSV outputs to {OUTPUT_FOLDER}/")
+    else:
+        st.success("Run complete.")
 elif st.session_state["main_results_cache"] is not None:
     _cache = st.session_state["main_results_cache"]
     df1 = _cache.get("df1")
@@ -2755,7 +2796,6 @@ elif st.session_state["main_results_cache"] is not None:
     week2_chainage_pvd_df = _cache.get("week2_chainage_pvd_df")
     pvd_design = _cache.get("pvd_design")
     pvd_design_summary_df = _cache.get("pvd_design_summary_df")
-    out_path = _cache.get("out_path")
     layers_df_for_x_section = _cache.get("layers_df_for_x_section")
     immediate_stage_df_x_section = _cache.get("immediate_stage_df_x_section")
     layer_table_x0 = _cache.get("layer_table_x0")
@@ -2803,7 +2843,7 @@ with left_col:
         if df1 is None:
             st.caption("- Waiting for run results.")
         else:
-            st.caption(f"- Max settlement: {float(df1['rho'].max()):.4f} m")
+            st.caption(f"- Max settlement: {float(df1['rho_total_m'].max()):.4f} m")
             st.caption(f"- Max Z_construct: {float(df1['Z_rev'].max()):.3f} mAOD")
 
 if df1 is not None:
@@ -2882,7 +2922,7 @@ if df1 is not None:
     H_fill_sec = float(r["H_fill"])
     H0_sec = float(r["H0"])
     B_base_sec = float(r["B_base"])
-    rho_total_sec = float(r["rho"])
+    rho_total_sec = float(r["rho_total_m"]) if "rho_total_m" in r.index else float(r["rho"])
     rho_total_center_sec = float(r["rho_total_center_m"]) if "rho_total_center_m" in r.index else float(rho_total_sec)
     rho_total_edge_sec = float(r["rho_total_edge_m"]) if "rho_total_edge_m" in r.index else float(rho_total_sec)
     half_w = max(100, B_base_sec / 2 + 25)
@@ -3077,19 +3117,37 @@ if df1 is not None:
             st.warning("Edge and centre total settlements are identical at all clay chainages. Check Craig-strip x offset wiring if this was not intended.")
 
     # -------------------------------------------------------------------------
-    # 3) Settlement (Primary Consolidation)
+    # 3) Settlement (Primary: Immediate + Consolidation)
     # -------------------------------------------------------------------------
-    st.header("Settlement (Primary Consolidation)")
+    st.header("Settlement (Primary: Immediate + Consolidation)")
     if monotonic_warnings:
         st.warning("Settlement should increase with higher fill; monotonicity failed for some cases (see Detailed tables).")
     with st.container(border=True):
         st.markdown("**Key results**")
         c_s1, c_s2, c_s3, c_s4 = st.columns(4)
-        c_s1.metric("Worst ρ_i (m)", f"{df1['rho_i'].max():.4f}")
-        c_s2.metric("Worst ρ_c (m)", f"{df1['rho_c'].max():.4f}")
-        c_s3.metric("Worst ρ_total (m)", f"{df1['rho'].max():.4f}")
-        c_s4.metric("End ρ_total at x=1000 (m)", f"{float(df1.loc[(df1['x'] - 1000.0).abs().idxmin(), 'rho']):.4f}")
+        c_s1.metric("Worst ρ_i (m)", f"{df1['rho_i_m'].max():.4f}")
+        c_s2.metric("Worst ρ_c (m)", f"{df1['rho_c_m'].max():.4f}")
+        c_s3.metric("Worst ρ_total (m)", f"{df1['rho_total_m'].max():.4f}")
+        c_s4.metric("End ρ_total at x=1000 (m)", f"{float(df1.loc[(df1['x'] - 1000.0).abs().idxmin(), 'rho_total_m']):.4f}")
         st.caption("ρ_i is currently assumed the same at centre and edge; only ρ_c varies by Craig-strip x offset.")
+    if all(col in df1.columns for col in ["x", "rho_i_m", "rho_c_m", "rho_total_m"]):
+        st.subheader("Settlement components vs total")
+        fig_sett_comp, ax_sett_comp = plt.subplots(figsize=(10, 4))
+        x_comp = df1["x"].astype(float).to_numpy()
+        ax_sett_comp.plot(x_comp, df1["rho_i_m"].astype(float).to_numpy(), label="ρ_i (immediate)", lw=2)
+        ax_sett_comp.plot(x_comp, df1["rho_c_m"].astype(float).to_numpy(), label="ρ_c (consolidation)", lw=2)
+        ax_sett_comp.plot(x_comp, df1["rho_total_m"].astype(float).to_numpy(), label="ρ_total = ρ_i + ρ_c", lw=2.5)
+        ax_sett_comp.set_xlabel("Chainage x (m)")
+        ax_sett_comp.set_ylabel("Settlement (m)")
+        ax_sett_comp.set_title("Settlement components and total along chainage")
+        ax_sett_comp.grid(True, alpha=0.3)
+        ax_sett_comp.legend(loc="best")
+        plt.tight_layout()
+        st.pyplot(fig_sett_comp)
+        plt.close(fig_sett_comp)
+
+    render_immediate_settlement_controls()
+
     with st.expander("Inputs used (read-only)", expanded=False):
         settlement_inputs_section_df = build_input_summary_df([
             {"Parameter": "Fill unit weight", "Symbol": "gamma_fill", "Value": float(gamma_fill), "Units": "kN/m^3"},
@@ -3139,7 +3197,7 @@ if df1 is not None:
             H0_i = float(r_surf["H0"])
             B_base_i = float(r_surf["B_base"])
             q_i = float(r_surf["q_equiv"])
-            rho_i_i = float(r_surf["rho_i"])
+            rho_i_i = float(r_surf["rho_i_m"])
             if use_flood_wt:
                 g_i = float(r_surf["ground level"])
                 z_wt_i = max(0.0, g_i - FLOOD_10YR_AOD_M)
@@ -3192,10 +3250,9 @@ if df1 is not None:
     ax_sett_3d.set_title("3D post-settlement road surface (Stage-2 detailed)")
     ax_sett_3d.view_init(elev=25, azim=-65)
     plt.tight_layout()
-    evidence_debug = st.expander("Details — settlement evidence and debug", expanded=False)
-    evidence_debug.pyplot(fig_sett_3d, use_container_width=True)
+    st.pyplot(fig_sett_3d, use_container_width=True)
+    st.caption("What am I looking at? Post-settlement surface along chainage and width, using p_total = p_i + p_c(y).")
     plt.close(fig_sett_3d)
-    evidence_debug.caption("Assumption: immediate settlement ρ_i is laterally constant; across-width variation comes from Craig-strip consolidation Δσ(y).")
 
     i_sec = int(np.argmin(np.abs(np.array(x_vals, dtype=float) - float(x_section))))
     j_center = int(np.argmin(np.abs(eta_vals - 0.0)))
@@ -3206,10 +3263,6 @@ if df1 is not None:
         {"point": "edge +", "eta": float(eta_vals[j_edge_p]), "y_m": float(Y_mesh[i_sec, j_edge_p]), "rho_total_m": float(rho_total_mesh[i_sec, j_edge_p]), "Z_post_mAOD": float(Z_post_mesh[i_sec, j_edge_p])},
         {"point": "edge -", "eta": float(eta_vals[j_edge_m]), "y_m": float(Y_mesh[i_sec, j_edge_m]), "rho_total_m": float(rho_total_mesh[i_sec, j_edge_m]), "Z_post_mAOD": float(Z_post_mesh[i_sec, j_edge_m])},
     ])
-    evidence_debug.markdown("**x_section sanity check (centre vs edges: ρ_total and Z_post)**")
-    evidence_debug.dataframe(sanity_df, use_container_width=True, hide_index=True)
-    evidence_debug.caption("Expected: ρ_total centre > edges and Z_post centre < edges (centre sags lower).")
-
     finite_mask = np.isfinite(rho_total_mesh)
     if finite_mask.any():
         surf_export_df = pd.DataFrame({
@@ -3220,41 +3273,58 @@ if df1 is not None:
         ensure_dir(OUTPUT_FOLDER)
         surf_export_path = os.path.join(OUTPUT_FOLDER, "settlement_surface_xy.csv")
         surf_export_df.to_csv(surf_export_path, index=False)
+
+    def _fmt_df_for_display(df_in: pd.DataFrame, sort_col: str = "x", decimals: int = 4) -> pd.DataFrame:
+        if df_in is None:
+            return pd.DataFrame()
+        out = df_in.copy()
+        if sort_col in out.columns:
+            out = out.sort_values(sort_col).reset_index(drop=True)
+        num_cols = out.select_dtypes(include=[np.number]).columns
+        if len(num_cols) > 0:
+            out[num_cols] = out[num_cols].round(decimals)
+        return out
+
+    # -------------------------------------------------------------------------
+    # C) Design impact
+    # -------------------------------------------------------------------------
+    st.subheader("Design impact")
     if run_preliminary_quick_stage:
-        evidence_debug.subheader("Preliminary quick settlement stage (lecture Stage 1)")
+        st.markdown("**Stage-1 quick profile (m AOD, m settlement)**")
+        st.caption("What this is: a lecture-style quick allowance profile along chainage. Why it exists: first-pass construction allowance check using total settlement.")
         if quick_stage_df is not None and len(quick_stage_df) > 0:
-            evidence_debug.dataframe(
-                quick_stage_df[
-                    ["x", "Z_finish", "rho_total_quick", "Z_req_construct", "Z_construct_stage1", "Z_post_stage1"]
-                ],
-                use_container_width=True,
-                hide_index=True,
+            quick_show = _fmt_df_for_display(
+                quick_stage_df[["x", "Z_finish", "rho_total_quick", "Z_req_construct", "Z_construct_stage1", "Z_post_stage1"]],
+                sort_col="x",
             )
+            st.dataframe(quick_show, use_container_width=True, hide_index=True, height=280)
+            st.caption("What am I looking at? For each chainage, the table compares design level, total settlement allowance, and resulting constructed/post-settlement levels.")
         if no_allow_violations_quick:
-            evidence_debug.info(
+            st.info(
                 "No allowance case: if built to Z_finish, post-settlement level drops below 55 m AOD at these chainages: "
                 + ", ".join([f"{x:.1f} m" for x in no_allow_violations_quick])
             )
         else:
-            evidence_debug.success("No allowance case: post-settlement level stays above 55 m AOD (unexpected but OK).")
+            st.success("No allowance case: post-settlement level stays above 55 m AOD (unexpected but OK).")
         if flood_violations_quick:
-            evidence_debug.error(
+            st.error(
                 "Stage-1 revised construction profile failed flood+1 check at chainages: "
                 + ", ".join([f"{x:.1f} m" for x in flood_violations_quick])
             )
         else:
-            evidence_debug.success("Stage-1 revised profile check passed: post-settlement level stays at/above 55 m AOD.")
+            st.success("Stage-1 revised profile check passed: post-settlement level stays at/above 55 m AOD.")
         if grade_violations:
-            evidence_debug.warning(
+            st.warning(
                 "Stage-1 grade check deviates from 1:200 at chainages starting: "
                 + ", ".join([f"{x:.1f} m" for x in grade_violations[:10]])
             )
         else:
-            evidence_debug.success("Stage-1 grade check passed: 1 in 200 crown enforced by construction profile.")
+            st.success("Stage-1 grade check passed: 1 in 200 crown enforced by construction profile.")
     if run_detailed_stage2_profile:
-        evidence_debug.subheader("Stage-2 Detailed Profile")
+        st.markdown("**Stage-2 detailed profile (m AOD, m settlement)**")
+        st.caption("What this is: centre/edge-resolved settlement profile used for detailed construction allowance. Why it exists: final pass/fail checks on flood and grade with total settlement.")
         if detailed_stage2_df is not None and len(detailed_stage2_df) > 0:
-            evidence_debug.dataframe(
+            d2_show = _fmt_df_for_display(
                 detailed_stage2_df[
                     [
                         "x", "Z_finish", "rho_total_stage2_worst", "rho_total_center", "rho_total_edge",
@@ -3262,82 +3332,173 @@ if df1 is not None:
                         "Z_post_stage2_center", "Z_post_stage2_edge",
                     ]
                 ],
-                use_container_width=True,
-                hide_index=True,
+                sort_col="x",
             )
+            st.dataframe(d2_show, use_container_width=True, hide_index=True, height=300)
+            st.caption("What am I looking at? This table shows chainage-wise worst/centre/edge settlement totals and the resulting required/achieved constructed and post-settlement levels.")
         if flood_violations_stage2:
-            evidence_debug.error(
+            st.error(
                 "Stage-2 detailed profile failed flood+1 check at chainages: "
                 + ", ".join([f"{x:.1f} m" for x in flood_violations_stage2])
             )
         else:
-            evidence_debug.success("Stage-2 detailed profile check passed: post-settlement level stays at/above 55 m AOD.")
+            st.success("Stage-2 detailed profile check passed: post-settlement level stays at/above 55 m AOD.")
         if grade_violations_stage2:
-            evidence_debug.warning(
+            st.warning(
                 "Stage-2 grade check deviates from 1:200 at chainages starting: "
                 + ", ".join([f"{x:.1f} m" for x in grade_violations_stage2[:10]])
             )
         else:
-            evidence_debug.success("Stage-2 grade check passed: 1 in 200 crown enforced by construction profile.")
-    evidence_debug.subheader("Settlement integration table at x_section (slices)")
-    if layers_df_for_x_section is not None:
-        evidence_debug.dataframe(layers_df_for_x_section, use_container_width=True, hide_index=True)
-    else:
-        evidence_debug.info("No settlement slices available (H0<=0 or settlement not computed at this chainage).")
-    if staged_construction_lifts:
-        evidence_debug.subheader("Immediate settlement staging at x_section")
-        if immediate_stage_df_x_section is not None and len(immediate_stage_df_x_section) > 0:
-            evidence_debug.dataframe(immediate_stage_df_x_section, use_container_width=True, hide_index=True)
-        else:
-            evidence_debug.info("No staged immediate-settlement rows at x_section (H_fill<=0 or no computed lifts).")
-        evidence_debug.caption("Staged construction: incremental ρ_i computed per lift; final ρ_i equals last stage.")
+            st.success("Stage-2 grade check passed: 1 in 200 crown enforced by construction profile.")
 
-    evidence_debug.subheader("x_section settlement vs time (using U targets)")
-    if week2_chainage_df is not None and len(week2_chainage_df) > 0 and "U20_t_years" in week2_chainage_df.columns:
-        i_sec = (df1["x"].astype(float) - float(x_section)).abs().idxmin()
-        r_sec = df1.loc[i_sec]
-        rho_i_sec = float(r_sec["rho_i"])
-        rho_c_sec = float(r_sec["rho_c"])
-        j_sec = (week2_chainage_df["x"].astype(float) - float(x_section)).abs().idxmin()
-        r_cons_sec = week2_chainage_df.loc[j_sec]
-        t20 = float(r_cons_sec["U20_t_years"])
-        t50 = float(r_cons_sec["U50_t_years"])
-        t90 = float(r_cons_sec["U90_t_years"])
-        x_section_time_df = pd.DataFrame(
-            [
-                {
-                    "U": 0.20,
-                    "t_years": t20,
-                    "S_consol_m": 0.20 * rho_c_sec,
-                    "S_consol_mm": 0.20 * rho_c_sec * 1000.0,
-                    "rho_total_m": rho_i_sec + (0.20 * rho_c_sec),
-                    "rho_total_mm": (rho_i_sec + (0.20 * rho_c_sec)) * 1000.0,
-                },
-                {
-                    "U": 0.50,
-                    "t_years": t50,
-                    "S_consol_m": 0.50 * rho_c_sec,
-                    "S_consol_mm": 0.50 * rho_c_sec * 1000.0,
-                    "rho_total_m": rho_i_sec + (0.50 * rho_c_sec),
-                    "rho_total_mm": (rho_i_sec + (0.50 * rho_c_sec)) * 1000.0,
-                },
-                {
-                    "U": 0.90,
-                    "t_years": t90,
-                    "S_consol_m": 0.90 * rho_c_sec,
-                    "S_consol_mm": 0.90 * rho_c_sec * 1000.0,
-                    "rho_total_m": rho_i_sec + (0.90 * rho_c_sec),
-                    "rho_total_mm": (rho_i_sec + (0.90 * rho_c_sec)) * 1000.0,
-                },
-            ]
-        )
-        evidence_debug.dataframe(x_section_time_df, use_container_width=True, hide_index=True)
-        evidence_debug.caption(
-            f"Nearest chainage used: x={float(r_sec['x']):.1f} m. "
-            f"Uses selected-method outputs from Week 1: rho_i={rho_i_sec:.4f} m, rho_c={rho_c_sec:.4f} m."
-        )
-    else:
-        evidence_debug.info("Run calculations to populate x_section settlement vs time.")
+    # -------------------------------------------------------------------------
+    # D) Detailed calculations
+    # -------------------------------------------------------------------------
+    evidence_debug = st.expander("Detailed calculations", expanded=False)
+    tab_imm, tab_chain, tab_key, tab_slice, tab_audit, tab_time = evidence_debug.tabs([
+        "Immediate settlement check",
+        "Chainage dataframe (inputs)",
+        "Key sections df",
+        "Settlement integration table (slices)",
+        "x_section audit check",
+        "Settlement vs time (U targets)",
+    ])
+
+    with tab_imm:
+        st.caption("What this is: a first-chainage immediate + consolidation snapshot. Why it exists: quick confirmation that total settlement equals ρ_i + ρ_c before profiles/exports.")
+        sanity_cols = [
+            "H_fill", "B_base", "H0", "H_over_B_immediate", "D_over_B_immediate",
+            "q_kpa_immediate", "cu_kpa_immediate", "eu_over_cu_immediate", "Eu_kpa_immediate",
+            "mu0_immediate", "mu1_immediate", "rho_i_m", "rho_c_m", "rho_total_m",
+        ]
+        imm_show = _fmt_df_for_display(df1.loc[[df1.index[0]], sanity_cols], sort_col="H_fill")
+        st.dataframe(imm_show, use_container_width=True, hide_index=True, height=250)
+        st.caption("What am I looking at? One representative row proving the immediate inputs and resulting total settlement used downstream.")
+
+    with tab_chain:
+        st.caption("What this is: full chainage-level input/output dataset. Why it exists: evidence that every plotted/exported total comes from the same per-chainage computation.")
+        chain_show = _fmt_df_for_display(df1, sort_col="x")
+        st.dataframe(chain_show, use_container_width=True, hide_index=True, height=320)
+        st.caption("What am I looking at? The master chainage dataframe feeding metrics, plots, checks, and exports.")
+
+    with tab_key:
+        st.caption("What this is: selected key sections (start/mid/end/extremes). Why it exists: concise checkpoints tied to the same total-settlement calculation.")
+        key_show = _fmt_df_for_display(key_df, sort_col="x")
+        st.dataframe(key_show, use_container_width=True, hide_index=True, height=260)
+        st.caption("What am I looking at? A compact subset of chainages used for report-friendly sanity checks.")
+
+    with tab_slice:
+        st.caption("What this is: depth-slice integration at x_section. Why it exists: slice-level evidence for how consolidation contributes to total settlement.")
+        st.markdown("**Settlement integration table at x_section (kPa, m)**")
+        if layers_df_for_x_section is not None:
+            slice_show = layers_df_for_x_section.rename(columns={
+                "sigma_v0_prime_kpa": "σ′₀ (kPa)",
+                "delta_sigma_kpa": "Δσ (kPa)",
+                "sigma_vf_prime_kpa": "σ′_vf (kPa)",
+                "ds_m": "ds (m)",
+                "s_cum_m": "s_cum (m)",
+            })
+            slice_show = _fmt_df_for_display(slice_show, sort_col="z_mid_m")
+            st.dataframe(slice_show, use_container_width=True, hide_index=True, height=300)
+            st.caption("What am I looking at? Slice-by-slice stresses and settlement increments whose cumulative value forms consolidation settlement at x_section.")
+            st.caption("Notation: σ′₀ = initial effective stress; σ′_vf = final effective stress after Δσ; s_cum = cumulative settlement to current depth slice.")
+
+            idx_sec_slice = (df1["x"].astype(float) - float(x_section)).abs().idxmin()
+            rho_c_at_x_section = float(df1.loc[idx_sec_slice, "rho_c_m"])
+            s_cum_last = float(layers_df_for_x_section["s_cum_m"].iloc[-1]) if "s_cum_m" in layers_df_for_x_section.columns and len(layers_df_for_x_section) > 0 else float("nan")
+            method_txt = str(df1.loc[idx_sec_slice, "rho_c_method"]) if "rho_c_method" in df1.columns else ""
+            uses_mv_design = "mv" in method_txt.lower()
+            if np.isfinite(s_cum_last):
+                mismatch = abs(s_cum_last - rho_c_at_x_section)
+                if mismatch <= 1e-6:
+                    st.success(f"Check passed: final slice cumulative value equals reported ρ_c at x_section ({s_cum_last:.4f} m).")
+                elif uses_mv_design:
+                    st.info(
+                        "The depth-slice table presents Cc-based theoretical consolidation settlement. "
+                        "The design value adopted in alignment calculations uses the mv method, consistent with lecture guidance."
+                    )
+                    st.caption(
+                        f"Method difference at x_section: s_cum_last (Cc table) = {s_cum_last:.4f} m, "
+                        f"reported ρ_c (design mv) = {rho_c_at_x_section:.4f} m."
+                    )
+                else:
+                    st.warning(
+                        f"Check mismatch: s_cum_last = {s_cum_last:.4f} m, reported ρ_c = {rho_c_at_x_section:.4f} m. "
+                        "Review slice integration settings and stress method consistency."
+                    )
+        else:
+            st.info("No settlement slices available (H0<=0 or settlement not computed at this chainage).")
+        st.markdown("**x_section centre/edge sanity (m settlement, m AOD)**")
+        sanity_ce = _fmt_df_for_display(sanity_df, sort_col="point")
+        st.dataframe(sanity_ce, use_container_width=True, hide_index=True, height=250)
+        st.caption("What am I looking at? Centre vs edge totals and post-levels; centre should generally settle more than edges.")
+
+    with tab_audit:
+        st.caption("What this is: x=0 depth audit plus first 5 slice rows. Why it exists: transparent check of stress terms that drive consolidation and therefore total settlement.")
+        if df1 is not None and len(df1) > 0 and layer_table_x0 is not None and len(layer_table_x0) > 0:
+            idx_x0 = (df1["x"] - 0.0).abs().idxmin()
+            r0 = df1.loc[idx_x0]
+            H0_x0 = float(r0["H0"])
+            z_mid = 0.5 * H0_x0
+            if use_flood_wt:
+                z_wt_val_ui = max(0.0, float(r0["ground level"]) - FLOOD_10YR_AOD_M)
+            else:
+                z_wt_val_ui = 0.0 if water_table_at_ground else float(z_wt_m)
+            if z_mid <= z_wt_val_ui:
+                sigma_v_mid = float(gamma_clay) * z_mid
+                u_mid = 0.0
+            else:
+                sigma_v_mid = float(gamma_clay) * z_wt_val_ui + float(gamma_clay) * (z_mid - z_wt_val_ui)
+                u_mid = float(gamma_w) * (z_mid - z_wt_val_ui)
+            sigma_v0_mid = max(sigma_v_mid - u_mid, 1e-3)
+            st.markdown(
+                f"**x=0 mid-depth (z=H0/2):** H0={H0_x0:.3f} m, z_mid={z_mid:.3f} m  \n"
+                f"σv={sigma_v_mid:.3f} kPa, u={u_mid:.3f} kPa → σ′v0={sigma_v0_mid:.3f} kPa"
+            )
+            audit_show = layer_table_x0.head(5).rename(columns={
+                "sigma_v0_prime_kpa": "σ′₀ (kPa)",
+                "delta_sigma_kpa": "Δσ (kPa)",
+                "sigma_vf_prime_kpa": "σ′_vf (kPa)",
+                "ds_m": "ds (m)",
+                "s_cum_m": "s_cum (m)",
+            })
+            audit_show = _fmt_df_for_display(audit_show, sort_col="z_mid_m")
+            st.dataframe(audit_show, use_container_width=True, hide_index=True, height=250)
+            st.caption("What am I looking at? First five x=0 slices used to verify stress-to-settlement integration inputs.")
+        else:
+            st.info("No settlement integration table available at x=0 (check H0 and inputs).")
+
+    with tab_time:
+        st.caption("What this is: x_section settlement against consolidation targets U20/U50/U90. Why it exists: links time factors to total settlement progression.")
+        if week2_chainage_df is not None and len(week2_chainage_df) > 0 and "U20_t_years" in week2_chainage_df.columns:
+            i_sec = (df1["x"].astype(float) - float(x_section)).abs().idxmin()
+            r_sec = df1.loc[i_sec]
+            rho_i_sec = float(r_sec["rho_i_m"])
+            rho_c_sec = float(r_sec["rho_c_m"])
+            j_sec = (week2_chainage_df["x"].astype(float) - float(x_section)).abs().idxmin()
+            r_cons_sec = week2_chainage_df.loc[j_sec]
+            t20 = float(r_cons_sec["U20_t_years"])
+            t50 = float(r_cons_sec["U50_t_years"])
+            t90 = float(r_cons_sec["U90_t_years"])
+            x_section_time_df = pd.DataFrame(
+                [
+                    {"U": 0.20, "t_years": t20, "S_consol_m": 0.20 * rho_c_sec, "S_consol_mm": 0.20 * rho_c_sec * 1000.0, "rho_total_m": rho_i_sec + (0.20 * rho_c_sec), "rho_total_mm": (rho_i_sec + (0.20 * rho_c_sec)) * 1000.0},
+                    {"U": 0.50, "t_years": t50, "S_consol_m": 0.50 * rho_c_sec, "S_consol_mm": 0.50 * rho_c_sec * 1000.0, "rho_total_m": rho_i_sec + (0.50 * rho_c_sec), "rho_total_mm": (rho_i_sec + (0.50 * rho_c_sec)) * 1000.0},
+                    {"U": 0.90, "t_years": t90, "S_consol_m": 0.90 * rho_c_sec, "S_consol_mm": 0.90 * rho_c_sec * 1000.0, "rho_total_m": rho_i_sec + (0.90 * rho_c_sec), "rho_total_mm": (rho_i_sec + (0.90 * rho_c_sec)) * 1000.0},
+                ]
+            )
+            time_show = _fmt_df_for_display(x_section_time_df, sort_col="U")
+            st.dataframe(time_show, use_container_width=True, hide_index=True, height=260)
+            st.caption(
+                f"What am I looking at? Nearest chainage x={float(r_sec['x']):.1f} m with immediate settlement fixed and consolidation scaled by U to form total settlement over time."
+            )
+        else:
+            st.info("Run calculations to populate x_section settlement vs time.")
+        if monotonic_warnings:
+            warn_show = _fmt_df_for_display(pd.DataFrame(monotonic_warnings), sort_col="x")
+            st.warning("Non-monotonic total settlement vs load detected (H_fill ↑ but ρ_total ↓).")
+            st.dataframe(warn_show, use_container_width=True, hide_index=True, height=250)
+            st.caption("What am I looking at? Any rows here flag chainages where a local load increase did not increase total settlement.")
 
     with evidence_debug:
         show_crosscheck = st.checkbox("Show method cross-check", value=False, key="show_crosscheck_lecturer")
@@ -3389,7 +3550,6 @@ if df1 is not None:
                     n_slices=n_slices_cross,
                 )
                 S_mv_slices = float(mv_table["S_total_m"])
-                # Assumption: mv is constant with depth for this simplified coursework model.
                 S_mv_mid = float(m_v) * delta_sigma_mid_cross * H0_sec
 
                 def _pct_diff(slice_val: float, mid_val: float) -> float:
@@ -3446,32 +3606,6 @@ if df1 is not None:
             st.info(f"x=0 summary unavailable: {x0_summary.get('reason', 'unknown issue')}")
         else:
             st.info("Run calculations to populate x=0 settlement/consolidation summary.")
-
-        if df1 is not None and len(df1) > 0 and layer_table_x0 is not None and len(layer_table_x0) > 0:
-            st.subheader("x=0 audit check")
-            idx_x0 = (df1["x"] - 0.0).abs().idxmin()
-            r0 = df1.loc[idx_x0]
-            H0_x0 = float(r0["H0"])
-            z_mid = 0.5 * H0_x0
-            if use_flood_wt:
-                z_wt_val_ui = max(0.0, float(r0["ground level"]) - FLOOD_10YR_AOD_M)
-            else:
-                z_wt_val_ui = 0.0 if water_table_at_ground else float(z_wt_m)
-            if z_mid <= z_wt_val_ui:
-                sigma_v_mid = float(gamma_clay) * z_mid
-                u_mid = 0.0
-            else:
-                sigma_v_mid = float(gamma_clay) * z_wt_val_ui + float(gamma_clay) * (z_mid - z_wt_val_ui)
-                u_mid = float(gamma_w) * (z_mid - z_wt_val_ui)
-            sigma_v0_mid = max(sigma_v_mid - u_mid, 1e-3)
-            st.markdown(
-                f"**x=0 mid-depth (z=H0/2):** H0={H0_x0:.3f} m, z_mid={z_mid:.3f} m  \n"
-                f"σv={sigma_v_mid:.3f} kPa, u={u_mid:.3f} kPa → σ′v0={sigma_v0_mid:.3f} kPa"
-            )
-            st.caption("Slice preview (first 5 rows) from settlement integration table at x≈0.")
-            st.dataframe(layer_table_x0.head(5), use_container_width=True, hide_index=True)
-        else:
-            st.info("No settlement integration table available at x=0 (check H0 and inputs).")
     with st.expander("Formulas used", expanded=False):
         q_formula_text = "q = γ_fill * H_fill" if q_immediate_method == Q_METHOD_LECTURE else "q = q_equiv (trapezoid)"
         st.markdown("E_u = (E_u/c_u) * c_u")
@@ -3486,8 +3620,10 @@ if df1 is not None:
             st.markdown("Stress point: centre (x=0) OR edge (x=B/2) applied to Δσ(z)")
         else:
             st.markdown("Quick approximation: Δσ(z)=q constant with depth (upper bound)")
-        st.markdown(r"**Terzaghi 1D (log10):** $ds=\frac{C_c}{1+e_0}dz\log_{10}\frac{\sigma'_{v0}+\Delta\sigma}{\sigma'_{v0}},\ S=\sum ds$")
-        st.latex(r"\rho_{\text{total}} = \rho_i + S")
+        st.markdown("**Terzaghi 1D (log10):**")
+        st.latex(r"ds = \frac{C_c}{1+e_0} \log_{10}\left(\frac{\sigma'_0 + \Delta \sigma}{\sigma'_0}\right)\,dz")
+        st.latex(r"\rho_c = \sum ds")
+        st.latex(r"\rho_{\text{total}} = \rho_i + \rho_c")
         st.latex(r"Z_{\text{construct}} = Z_{\text{finish}} + \rho_{\text{total}}")
     st.caption("**Values carried forward →** rho_total used for Z_construct and construction cross-section")
     st.markdown("**Evidence notes:**")
@@ -4191,7 +4327,7 @@ if df1 is not None:
     sum_rows = [
         {"Metric": "Max H_fill (m)", "Value": f"{df1['H_fill'].max():.3f}"},
         {"Metric": "Max q_equiv (kPa)", "Value": f"{df1['q_equiv'].max():.2f}"},
-        {"Metric": "Max ρ_total (m)", "Value": f"{df1['rho'].max():.4f}"},
+        {"Metric": "Max ρ_total (m)", "Value": f"{df1['rho_total_m'].max():.4f}"},
         {"Metric": "Max Z_construct (mAOD)", "Value": f"{df1['Z_rev'].max():.3f}"},
     ]
     x_vol = df1["x"].values
@@ -4226,52 +4362,12 @@ if df1 is not None:
 | H_fill | {float(rw_we['H_fill']):.3f} m |
 | B_base | {float(rw_we['B_base']):.3f} m |
 | q | {float(rw_we['q_equiv']):.3f} kPa |
-| ρ_i | {float(rw_we['rho_i']):.4f} m |
-| ρ_c | {float(rw_we['rho_c']):.4f} m |
-| ρ_total | {float(rw_we['rho']):.4f} m |
+| ρ_i | {float(rw_we['rho_i_m']):.4f} m |
+| ρ_c | {float(rw_we['rho_c_m']):.4f} m |
+| ρ_total | {float(rw_we['rho_total_m']):.4f} m |
 | Z_construct | {float(rw_we['Z_rev']):.3f} mAOD |
 """)
 
-    with evidence_debug:
-        st.markdown("**Chainage df**")
-        st.dataframe(df1, use_container_width=True, hide_index=True)
-        st.markdown("**Key sections df**")
-        st.dataframe(key_df, use_container_width=True, hide_index=True)
-        st.markdown("**Week2 time df**")
-        st.dataframe(week2_chainage_df, use_container_width=True, hide_index=True)
-        if run_slope_stability and isinstance(slope_stab_result, dict):
-            trials_df_debug = slope_stab_result.get("trials_df")
-            geom_debug = slope_stab_result.get("geometry", {})
-            if trials_df_debug is not None and len(trials_df_debug) > 0:
-                st.markdown("**Slope trials df**")
-                st.dataframe(trials_df_debug, use_container_width=True, hide_index=True)
-            if geom_debug:
-                _xt = float(geom_debug.get("toe", (0, 0))[0])
-                _xc = float(geom_debug.get("crest", (0, 0))[0])
-                _zt = float(geom_debug.get("toe", (0, 0))[1])
-                _zc = float(geom_debug.get("crest", (0, 0))[1])
-                _H  = float(geom_debug.get("H", 0.0))
-                _x_mid = 0.5 * (_xc + _xt)
-                _construction = geom_debug.get("construction", {})
-                _centres = _construction.get("centres", [])
-                st.markdown("**Slope geometry (centre debug)**")
-                st.code(
-                    f"x_crest={_xc:.3f}  x_mid={_x_mid:.3f}  x_toe={_xt:.3f}\n"
-                    f"z_crest={_zc:.3f}  z_toe={_zt:.3f}  H={_H:.3f}\n"
-                    f"Box x: [{float(_construction.get('x_left', _xc)):.3f}, {float(_construction.get('x_right', _xt)):.3f}]\n"
-                    f"Box z: [{float(_construction.get('z_bottom', _zc)):.3f}, {float(_construction.get('z_top', _zc + 0.75 * _H)):.3f}]\n"
-                    + "\n".join(
-                        f"{c.get('trial_id', '?')}: ({float(c.get('x', 0.0)):.3f}, {float(c.get('z', 0.0)):.3f})"
-                        for c in _centres
-                    )
-                )
-        val_df = pd.DataFrame(settlement_summary)
-        st.markdown("**Settlement summary (key chainages)**")
-        st.dataframe(val_df, use_container_width=True, hide_index=True)
-        if monotonic_warnings:
-            warn_df = pd.DataFrame(monotonic_warnings)
-            st.warning("Non-monotonic settlement vs load detected (H_fill ↑ but ρ_c ↓). See table below.")
-            st.dataframe(warn_df, use_container_width=True, hide_index=True)
     st = _st_module
 
 else:

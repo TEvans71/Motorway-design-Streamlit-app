@@ -8,3 +8,6 @@ venv/
 .mypy_cache/
 out_motorway/
 outputs/
+*.csv
+*.xlsx
+.streamlit/
