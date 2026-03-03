@@ -19,15 +19,22 @@ import pandas as pd
 import numpy as np
 
 from geotech_core_settlement import (
-    Ur_barron_from_Tr,
     StressInputs,
     build_settlement_integration_table,
     build_settlement_integration_table_mv,
     consolidation_times_table,
-    consolidation_times_table_pvd,
-    pvd_design_fixed_point,
+    consolidation_times_table_sand_drain,
+    plot_sand_drains_plan_view,
+    sand_drain_design_fixed_point,
     settlement_primary_1d,
     sigma_v0_prime_kpa,
+)
+from geotech_bearing_capacity import (
+    CU_PROFILE_POINTS,
+    CU_PROFILE_Z_MAX_M,
+    compute_bearing_capacity_table,
+    cu_at_depth_kpa,
+    cu_min_over_depth_kpa,
 )
 
 APP_BUILD = "9bd2a5e"  # update this when you deploy
@@ -125,7 +132,7 @@ Z_EXAG = 15.0
 Uv_targets = [0.20, 0.50, 0.90]
 Cv_m2_per_s = 1e-7
 vertical_drainage = "double"
-# Locked PVD constants (from lecture notes)
+# Locked sand-drain constants (from lecture notes)
 Ur_target = 0.88764
 t_design_years = 2.0
 Ch_m2_per_s = 1e-7
@@ -262,6 +269,25 @@ def render_project_inputs_locked(coursework_inputs: dict):
         with st.sidebar.expander(section_name, expanded=False):
             for item in items:
                 st.write(f"**{item['label']}** — {_format_locked_value(item)}")
+
+
+def build_input_summary_df(rows: list[dict]) -> pd.DataFrame:
+    """Create a consistent read-only input summary table."""
+    return pd.DataFrame(rows, columns=["Parameter", "Symbol", "Value", "Units"])
+
+
+class _StreamlitColumnProxy:
+    """Route UI calls to a column while keeping module attributes available."""
+
+    def __init__(self, container, st_module):
+        self._container = container
+        self._st_module = st_module
+
+    def __getattr__(self, name):
+        # Prefer module-level API first (e.g., spinner, tabs, cache decorators).
+        if hasattr(self._st_module, name):
+            return getattr(self._st_module, name)
+        return getattr(self._container, name)
 
 # =============================================================================
 # 2) HELPERS — WEEK 1 (Ted's logic, unchanged)
@@ -1188,11 +1214,12 @@ def week2_run(df_week1_chainage: pd.DataFrame):
 
 
 def week2_run_pvd(df_week1_chainage: pd.DataFrame, pvd_design: dict):
-    """Compute combined consolidation time (vertical + Barron radial) along chainage."""
+    """Compute combined consolidation time (vertical + sand-drain radial) along chainage."""
     if "H0" not in df_week1_chainage.columns:
         raise KeyError("Week 1 dataframe must contain 'H0' column.")
     rows = []
-    De_m = float(pvd_design["De_m"])
+    spacing_s_m = float(pvd_design["S_m"])
+    rd_value_m = float(pvd_design["rd_m"])
     n_final = float(pvd_design["n_final"])
     for _, r in df_week1_chainage.iterrows():
         x, H = float(r["x"]), float(r["H0"])
@@ -1204,21 +1231,20 @@ def week2_run_pvd(df_week1_chainage: pd.DataFrame, pvd_design: dict):
                 "Hd_m": 0.0,
                 "Cv_m2_per_s": Cv_m2_per_s,
                 "Ch_m2_per_s": Ch_m2_per_s,
-                "De_m": De_m,
+                "spacing_s_m": spacing_s_m,
+                "rd_m": rd_value_m,
                 "n_final": n_final,
-                "U20_t_years": float("inf"),
-                "U50_t_years": float("inf"),
                 "U90_t_years": float("inf"),
             })
             continue
-        times_df = consolidation_times_table_pvd(
+        times_df = consolidation_times_table_sand_drain(
             Cv_m2_per_s=Cv_m2_per_s,
             H0_m=H,
             drainage=vertical_drainage,
             Ch_m2_per_s=Ch_m2_per_s,
-            De_m=De_m,
-            n_final=n_final,
-            U_targets=Uv_targets,
+            spacing_s_m=spacing_s_m,
+            rd_m=rd_value_m,
+            U_targets=(0.90,),
         )
         row = {
             "x": x,
@@ -1226,7 +1252,8 @@ def week2_run_pvd(df_week1_chainage: pd.DataFrame, pvd_design: dict):
             "vertical_drainage": vertical_drainage,
             "Cv_m2_per_s": float(Cv_m2_per_s),
             "Ch_m2_per_s": float(Ch_m2_per_s),
-            "De_m": float(De_m),
+            "spacing_s_m": float(spacing_s_m),
+            "rd_m": float(rd_value_m),
             "n_final": float(n_final),
         }
         if len(times_df) > 0:
@@ -1235,20 +1262,17 @@ def week2_run_pvd(df_week1_chainage: pd.DataFrame, pvd_design: dict):
                 if col.startswith("U") and col.endswith("_t_years"):
                     row[col] = float(times_df.iloc[0][col])
             try:
-                t20 = row.get("U20_t_years", None)
-                t50 = row.get("U50_t_years", None)
                 t90 = row.get("U90_t_years", None)
-                if all(v is not None for v in [t20, t50, t90]):
-                    if not (t20 < t50 < t90):
-                        raise ValueError(f"Combined consolidation time monotonicity failed at x={x:.1f} m.")
+                if t90 is not None and (not math.isfinite(float(t90)) or float(t90) <= 0.0):
+                    raise ValueError(f"Combined consolidation t90 invalid at x={x:.1f} m.")
             except KeyError:
                 pass
         rows.append(row)
     out_df = pd.DataFrame(rows)
     if "Cv_m2_per_s" not in out_df.columns or "Ch_m2_per_s" not in out_df.columns:
-        raise ValueError("Cv/Ch must be > 0 for PVD consolidation time.")
+        raise ValueError("Cv/Ch must be > 0 for sand drain consolidation time.")
     if (out_df["Cv_m2_per_s"].astype(float) <= 0.0).any() or (out_df["Ch_m2_per_s"].astype(float) <= 0.0).any():
-        raise ValueError("Cv/Ch must be > 0 for PVD consolidation time.")
+        raise ValueError("Cv/Ch must be > 0 for sand drain consolidation time.")
     return out_df
 
 import numpy as np
@@ -1447,76 +1471,21 @@ def export_additional_csvs(
 # 5B) SLOPE STABILITY (WEEK 5) — Short-term undrained circular slip
 # =============================================================================
 
-@dataclass
-class TrialSpec:
-    name: str
-    n_slices: int
-    slope_position: str = "middle"   # left | middle | right
-    crest_height_mode: str = "0H"    # 0H above crest | 3/4H above crest
-    toe_offset_mode: str = "2H"      # 2H on toe | 4H on toe
-    x_c: Optional[float] = None      # manual override
-    z_c: Optional[float] = None      # manual override
-
-
-def _parse_crest_height_factor(mode: str) -> float:
-    token = str(mode).strip().lower().replace(" ", "")
-    if "3/4" in token or "0.75" in token:
-        return 0.75
-    return 0.0
-
-
-def _parse_toe_offset_factor(mode: str) -> float:
-    token = str(mode).strip().lower().replace(" ", "")
-    if "4h" in token:
-        return 4.0
-    return 2.0
-
-
-def _resolve_trial_centre(spec: TrialSpec, toe: tuple, crest: tuple, H: float, side: str) -> tuple:
-    """
-    Resolve trial centre from descriptor mode or manual override.
-    Manual x_c/z_c always take precedence.
-
-    Lecture construction (Barnes/Craig 9-point grid):
-      3 vertical guides:   x_left = x_crest
-                           x_mid  = 0.5*(x_crest + x_toe)
-                           x_right= x_toe
-      3 horizontal guides: z0   = z_crest  (0H above crest)
-                           z075 = z_crest + 0.75*H
-                           z3   = z_crest + Z3_FACTOR*H  (see Z3_FACTOR constant)
-
-      slope_position → x:   "left"   → x_left (at crest)
-                            "middle" → x_mid
-                            "right"  → x_right (at toe)
-      crest_height_mode → z: "0H"   → z0
-                             "3/4H" → z075
-    Each trial centre is the exact intersection point (one of the 9 grid points).
-    """
-    if spec.x_c is not None and spec.z_c is not None:
-        return float(spec.x_c), float(spec.z_c), "manual"
-    x_toe, _ = toe
-    x_crest, z_crest = crest
-    # x: map slope_position to one of the 3 vertical guide x-coordinates
-    slope_pos = str(spec.slope_position).strip().lower()
-    if slope_pos == "left":
-        x_c = float(x_crest)
-    elif slope_pos == "right":
-        x_c = float(x_toe)
-    else:  # middle
-        x_c = 0.5 * (float(x_crest) + float(x_toe))
-    # z: crest level + height factor * H
-    z_c = float(z_crest) + _parse_crest_height_factor(spec.crest_height_mode) * float(H)
-    return float(x_c), float(z_c), "descriptor"
+SLOPE_STABILITY_CU_KPA = 69.5
 
 
 def _roots_surface_minus_circle(surface_z: Callable[[float], float], x_c: float, z_c: float, R: float,
-                                n_samples: int = 2400) -> list:
+                                x_min: float, x_max: float, n_samples: int = 2400) -> list:
     """
     Robustly find roots of f(x)=z_surface(x)-z_circle_lower(x) using sign-change scan.
     """
     if R <= 0:
         return []
-    x_vals = np.linspace(x_c - R, x_c + R, int(max(400, n_samples)))
+    xa = float(min(x_min, x_max))
+    xb = float(max(x_min, x_max))
+    if xb - xa <= 1e-12:
+        return []
+    x_vals = np.linspace(xa, xb, int(max(400, n_samples)))
     rad = np.maximum(0.0, R**2 - (x_vals - x_c)**2)
     z_circle = z_c - np.sqrt(rad)  # lower arc
     z_surf = np.array([float(surface_z(x)) for x in x_vals], dtype=float)
@@ -1543,14 +1512,86 @@ def _roots_surface_minus_circle(surface_z: Callable[[float], float], x_c: float,
     return uniq
 
 
+def _build_slope_stability_centres(toe: tuple, crest: tuple, H: float) -> dict:
+    """
+    Lecture construction box + 9 slip-circle centres as a TRUE 3×3 grid.
+
+    Box rules (lecture):
+    - Width = horizontal distance between toe and crest (plan view)
+    - Box base sits on crest level
+    - Box height = 0.75 * H (H = crest_z - toe_z)
+
+    Grid rules:
+    - x positions: left, mid, right
+    - z positions: bottom, mid, top
+    - Labels arranged:
+        F   C   G
+        D   A   E
+        H   B   I
+    """
+    x_toe, z_toe = float(toe[0]), float(toe[1])
+    x_crest, z_crest = float(crest[0]), float(crest[1])
+
+    H_val = float(H)
+    if H_val <= 0:
+        H_val = max(1e-6, z_crest - z_toe)
+
+    # Box horizontal extents: toe to crest
+    x_left = min(x_toe, x_crest)
+    x_right = max(x_toe, x_crest)
+    x_mid = 0.5 * (x_left + x_right)
+
+    # Box vertical extents: base at crest, height = 0.75H
+    z_bottom = z_crest
+    z_top = z_crest + 0.75 * H_val
+    z_mid = 0.5 * (z_bottom + z_top)
+
+    width = x_right - x_left
+    height = z_top - z_bottom
+
+    x1 = x_left + 0.25 * width
+    x2 = x_left + 0.50 * width
+    x3 = x_left + 0.75 * width
+
+    z1 = z_bottom + 0.25 * height
+    z2 = z_bottom + 0.50 * height
+    z3 = z_bottom + 0.75 * height
+
+    # 3×3 grid points (inside the box, not on edges)
+    centres = [
+        # top row
+        {"trial_id": "F", "x": x1, "z": z3},
+        {"trial_id": "C", "x": x2, "z": z3},
+        {"trial_id": "G", "x": x3, "z": z3},
+        # middle row
+        {"trial_id": "D", "x": x1, "z": z2},
+        {"trial_id": "A", "x": x2, "z": z2},
+        {"trial_id": "E", "x": x3, "z": z2},
+        # bottom row
+        {"trial_id": "H", "x": x1, "z": z1},
+        {"trial_id": "B", "x": x2, "z": z1},
+        {"trial_id": "I", "x": x3, "z": z1},
+    ]
+
+    return {
+        "x_left": x_left,
+        "x_right": x_right,
+        "x_mid": x_mid,
+        "z_bottom": z_bottom,
+        "z_mid": z_mid,
+        "z_top": z_top,
+        "width": x_right - x_left,
+        "height": z_top - z_bottom,
+        "centres": centres,
+    }
+
+
 def phi0_slices_fos(surface_z: Callable[[float], float], ground_z: float,
-                    toe: tuple, centre: tuple, cu_kpa: float,
+                    toe: tuple, crest: tuple, side: str, centre: tuple, cu_kpa: float,
                     gamma_fill: float, gamma_clay: float, n_slices: int) -> tuple:
     """
     phi=0 ordinary method of slices (lecture):
-      F = Σ(Cu·b·sec α) / Σ(W·sin α)      ← SIGNED sin α
-      alpha is positive on the driving (toe) side, negative on the passive (crest) side.
-      Passive slices contribute NEGATIVE Di, reducing the net driving force.
+      F = Σ(Cu·b·sec α) / Σ(W·sin α)
     alpha from circle tangent at each slice midpoint:
       dzdx = -(x_mid - x_c)/(z_base - z_c), alpha = atan(dzdx)
     """
@@ -1566,37 +1607,65 @@ def phi0_slices_fos(surface_z: Callable[[float], float], ground_z: float,
         "sum_Ti": 0.0,
         "sum_Di": 0.0,
     }
-    columns = ["slice", "b", "z_surf", "z_base", "h", "A_fill", "A_clay", "W",
-               "alpha_deg", "sec_a", "sin_a", "Ti", "Di"]
+    columns = [
+        "slice_no", "x_mid", "b_m", "z_top", "z_bottom", "area_m2", "gamma_kN_per_m3", "W_kN",
+        "alpha_rad", "alpha_deg", "sec_alpha", "W_sin_alpha", "cu_kPa", "Ti_cubseca", "Di_Wsina",
+    ]
     if R <= 0.0 or int(n_slices) <= 0:
         meta["reason"] = "invalid_radius_or_slices"
         return (float("nan"), pd.DataFrame(columns=columns), meta)
-    roots = _roots_surface_minus_circle(surface_z, x_c, z_c, R, n_samples=max(600, int(n_slices) * 80))
-    if len(roots) != 2:
-        meta["reason"] = "requires_exactly_two_intersections"
-        meta["roots"] = roots
+    x_crest = float(crest[0])
+
+    # Find second intersection using the FULL ground profile:
+    # horizontal crest/platform + slope face + horizontal ground line.
+    x_scan_min = min(x_c - R, x_toe, x_crest) - max(1.0, 0.05 * max(1.0, R))
+    x_scan_max = max(x_c + R, x_toe, x_crest) + max(1.0, 0.05 * max(1.0, R))
+    xs_scan = np.linspace(x_scan_min, x_scan_max, max(1200, int(n_slices) * 160))
+    z_ground_scan = np.array([surface_z(float(x)) for x in xs_scan], dtype=float)
+    rad_scan = R**2 - (xs_scan - x_c) ** 2
+    z_circle_lower = np.full_like(xs_scan, np.nan, dtype=float)
+    ok_scan = rad_scan >= 0.0
+    z_circle_lower[ok_scan] = z_c - np.sqrt(rad_scan[ok_scan])
+    diff = z_ground_scan - z_circle_lower
+    hit_tol = max(1e-3, 1e-4 * max(1.0, R))
+    roots_ground = []
+    for i in range(len(xs_scan) - 1):
+        d1 = float(diff[i])
+        d2 = float(diff[i + 1])
+        if not (np.isfinite(d1) and np.isfinite(d2)):
+            continue
+        x1 = float(xs_scan[i])
+        x2 = float(xs_scan[i + 1])
+        if abs(d1) <= hit_tol:
+            roots_ground.append(x1)
+        if d1 * d2 < 0.0:
+            x_root = x1 - d1 * (x2 - x1) / (d2 - d1)
+            roots_ground.append(float(x_root))
+    if np.isfinite(diff[-1]) and abs(float(diff[-1])) <= hit_tol:
+        roots_ground.append(float(xs_scan[-1]))
+    roots_ground = sorted(roots_ground)
+    roots_ground_uniq = []
+    root_tol = max(1e-4, 1e-5 * max(1.0, R))
+    for xr in roots_ground:
+        if not roots_ground_uniq or abs(xr - roots_ground_uniq[-1]) > root_tol:
+            roots_ground_uniq.append(float(xr))
+
+    toe_tol = 1e-3
+    roots_non_toe = [float(xr) for xr in roots_ground_uniq if abs(float(xr) - x_toe) >= toe_tol]
+    if len(roots_non_toe) == 0:
+        meta["reason"] = "no_second_intersection_with_ground_profile"
+        meta["roots_ground"] = roots_ground_uniq
         return (float("nan"), pd.DataFrame(columns=columns), meta)
-    x_L, x_R = float(min(roots)), float(max(roots))
+    x_int = float(min(roots_non_toe, key=lambda xr: abs(float(xr) - x_toe)))
+    x_L, x_R = float(min(x_int, x_toe)), float(max(x_int, x_toe))
     if x_R - x_L <= 1e-9:
         meta["reason"] = "degenerate_intersection_span"
         meta["x_L"], meta["x_R"] = x_L, x_R
         return (float("nan"), pd.DataFrame(columns=columns), meta)
     x_edges = np.linspace(x_L, x_R, int(n_slices) + 1)
 
-    # Safety check: if every surface z equals ground_z but the embankment
-    # has appreciable height, the caller probably passed the wrong surface function.
-    _x_mids_check = np.linspace(x_L, x_R, min(10, int(n_slices) + 1))
-    _z_surf_check = np.array([float(surface_z(x)) for x in _x_mids_check])
-    _z_crest_approx = float(surface_z(0.5 * (x_L + x_R)))
-    if (np.allclose(_z_surf_check, ground_z, atol=1e-6)
-            and abs(_z_crest_approx - ground_z) < 1e-6
-            and abs(x_R - x_L) > 0.5):
-        # All surface samples equal ground_z — surface_z is returning ground level,
-        # not the embankment surface.  Flag this trial as invalid.
-        meta["reason"] = "z_surf_using_ground_not_surface"
-        return (float("nan"), pd.DataFrame(columns=columns), meta)
-
     rows = []
+    cu_kPa = float(SLOPE_STABILITY_CU_KPA)
     sum_Ti = 0.0
     sum_Di = 0.0
     for i in range(int(n_slices)):
@@ -1604,85 +1673,84 @@ def phi0_slices_fos(surface_z: Callable[[float], float], ground_z: float,
         x_right = float(x_edges[i + 1])
         x_mid = 0.5 * (x_left + x_right)
         b = x_right - x_left
-        z_surf = float(surface_z(x_mid))
+        z_top = float(surface_z(x_mid))
         radicand = R**2 - (x_mid - x_c)**2
         if radicand < 0.0:
-            z_base = float("nan")
+            z_bottom = float("nan")
             h = 0.0
             A_fill = 0.0
             A_clay = 0.0
+            area_m2 = 0.0
+            gamma_eff = float("nan")
             W = 0.0
             alpha = 0.0
             sec_a = 1.0
-            sinabs = 0.0
+            sin_a = 0.0
             Ti = 0.0
             Di = 0.0
         else:
-            z_base = z_c - math.sqrt(max(0.0, radicand))  # lower arc
-            h = max(0.0, z_surf - z_base)
-            A_fill = max(0.0, z_surf - max(z_base, ground_z)) * b
-            A_clay = max(0.0, min(z_surf, ground_z) - z_base) * b
+            z_bottom = z_c - math.sqrt(max(0.0, radicand))  # lower arc
+            h = max(0.0, z_top - z_bottom)
+            A_fill = max(0.0, z_top - max(z_bottom, ground_z)) * b
+            A_clay = max(0.0, min(z_top, ground_z) - z_bottom) * b
+            area_m2 = A_fill + A_clay
             W = gamma_fill * A_fill + gamma_clay * A_clay
-            denom = z_base - z_c
+            gamma_eff = (W / area_m2) if area_m2 > 0.0 else float("nan")
+            denom = z_bottom - z_c
             if abs(denom) < 1e-12:
                 alpha = 0.0
             else:
                 dzdx = -(x_mid - x_c) / denom
-                alpha = math.atan(dzdx)
+                alpha = abs(math.atan(dzdx))
             sec_a = 1.0 / max(1e-12, math.cos(alpha))
-            # Signed sin: passive (left-side) slices have alpha < 0 → Di < 0 → subtract from driving force
             sin_a = math.sin(alpha)
-            Ti = cu_kpa * b * sec_a
+            Ti = cu_kPa * b * sec_a
             Di = W * sin_a
             sum_Ti += Ti
             sum_Di += Di
         rows.append({
-            "slice": i + 1,
-            "b": b,
-            "z_surf": z_surf,
-            "z_base": z_base,
-            "h": h,
-            "A_fill": A_fill,
-            "A_clay": A_clay,
-            "W": W,
-            "alpha_deg": math.degrees(alpha),  # signed: negative left of centre, positive right
-            "sec_a": sec_a,
-            "sin_a": sin_a,     # signed — negative for passive (left-side) slices
-            "Ti": Ti,
-            "Di": Di,           # negative for passive slices
+            "slice_no": i + 1,
+            "x_mid": x_mid,
+            "b_m": b,
+            "z_top": z_top,
+            "z_bottom": z_bottom,
+            "area_m2": area_m2,
+            "gamma_kN_per_m3": gamma_eff,
+            "W_kN": W,
+            "alpha_rad": alpha,
+            "alpha_deg": math.degrees(alpha),
+            "sec_alpha": sec_a,
+            "W_sin_alpha": Di,
+            "cu_kPa": cu_kPa,
+            "Ti_cubseca": Ti,
+            "Di_Wsina": Di,
         })
-    fos = float(sum_Ti / sum_Di) if sum_Di > 0.0 else float("nan")
     slices_df = pd.DataFrame(rows, columns=columns)
+    sum_Ti = float(slices_df["Ti_cubseca"].sum())
+    sum_Di = float(slices_df["Di_Wsina"].sum())
+    fos = float(sum_Ti / sum_Di) if sum_Di > 0.0 else float("nan")
     meta.update({
         "valid": np.isfinite(fos),
         "x_L": x_L,
         "x_R": x_R,
-        "sum_Ti": float(sum_Ti),
-        "sum_Di": float(sum_Di),
+        "x_int": x_int,
+        "x_toe": x_toe,
+        "x_crest": x_crest,
+        "sum_Ti": sum_Ti,
+        "sum_Di": sum_Di,
+        "cu_kPa": cu_kPa,
     })
     return fos, slices_df, meta
 
 
-def _default_phi0_trial_specs(n_slices: int) -> list:
-    return [
-        TrialSpec(name="Trial 1", n_slices=int(n_slices), slope_position="left", crest_height_mode="0H", toe_offset_mode="2H"),
-        TrialSpec(name="Trial 2", n_slices=int(n_slices), slope_position="middle", crest_height_mode="0H", toe_offset_mode="2H"),
-        TrialSpec(name="Trial 3", n_slices=int(n_slices), slope_position="right", crest_height_mode="0H", toe_offset_mode="2H"),
-        TrialSpec(name="Trial 4", n_slices=int(n_slices), slope_position="left", crest_height_mode="3/4H", toe_offset_mode="4H"),
-        TrialSpec(name="Trial 5", n_slices=int(n_slices), slope_position="middle", crest_height_mode="3/4H", toe_offset_mode="4H"),
-        TrialSpec(name="Trial 6", n_slices=int(n_slices), slope_position="right", crest_height_mode="3/4H", toe_offset_mode="4H"),
-    ]
-
-
 def run_phi0_trials(df1: pd.DataFrame, x_stability: float, B_top: float, side: str,
-                    cu_kpa: float, gamma_fill: float, gamma_clay: float,
-                    trial_specs: list) -> tuple:
+                    gamma_fill: float, gamma_clay: float, n_slices: int,
+                    cu_kpa: float = SLOPE_STABILITY_CU_KPA) -> tuple:
     """
-    Run phi=0 lecture-method trials.
+    Run phi=0 lecture-method trials for the 9 box-construction centres.
     Returns:
-      - trials_df summary
-      - critical_trial row (min FoS)
-      - dict trial_name -> (slices_df, meta)
+      - trials_df summary (one row per trial centre A..I)
+      - dict trial_id -> (slices_df, meta)
       - geometry dict
     """
     idx = (df1["x"] - x_stability).abs().idxmin()
@@ -1697,55 +1765,52 @@ def run_phi0_trials(df1: pd.DataFrame, x_stability: float, B_top: float, side: s
     toe = (float(x_toe), float(ground_z))
     crest = (float(x_crest), float(z_finish))
     surface_fn = lambda x: z_surface_half(float(x), ground_z, z_finish, side_name, B_top, B_base)
+    construction = _build_slope_stability_centres(toe=toe, crest=crest, H=H)
     trial_rows = []
     trial_details = {}
-    for spec in trial_specs:
-        x_c, z_c, centre_mode = _resolve_trial_centre(spec, toe, crest, H, side_name)
+    for c in construction["centres"]:
+        trial_id = str(c["trial_id"])
+        x_c = float(c["x"])
+        z_c = float(c["z"])
         R = float(math.hypot(x_c - toe[0], z_c - toe[1]))
-        print(
-            f"[phi0 debug] {spec.name}: "
-            f"grid=({spec.slope_position}/{spec.crest_height_mode})  "
-            f"x_crest={x_crest:.3f}  z_crest={z_finish:.3f}  "
-            f"x_toe={x_toe:.3f}  z_toe={ground_z:.3f}  "
-            f"H={H:.3f}  "
-            f"x_c={x_c:.3f}  z_c={z_c:.3f}  "
-            f"R={math.hypot(x_c - x_toe, z_c - ground_z):.3f}"
-        )
-        slices_df = pd.DataFrame(columns=["slice", "b", "z_surf", "z_base", "h", "A_fill", "A_clay", "W", "alpha_deg", "sec", "sinabs", "Ti", "Di"])
+        slices_df = pd.DataFrame(columns=[
+            "slice_no", "x_mid", "b_m", "z_top", "z_bottom", "area_m2", "gamma_kN_per_m3", "W_kN",
+            "alpha_rad", "alpha_deg", "sec_alpha", "W_sin_alpha", "cu_kPa", "Ti_cubseca", "Di_Wsina",
+        ])
         meta = {"valid": False, "reason": None, "R": R}
         fos = float("nan")
         if H <= 0.0:
             meta["reason"] = "zero_embankment_height"
-        elif R > 4.0 * H:
-            meta["reason"] = "radius_exceeds_4H"
         else:
             fos, slices_df, meta = phi0_slices_fos(
                 surface_z=surface_fn,
                 ground_z=ground_z,
                 toe=toe,
+                crest=crest,
+                side=side_name,
                 centre=(x_c, z_c),
                 cu_kpa=cu_kpa,
                 gamma_fill=gamma_fill,
                 gamma_clay=gamma_clay,
-                n_slices=int(spec.n_slices),
+                n_slices=int(n_slices),
             )
-        meta["centre_mode"] = centre_mode
+            if not np.isfinite(fos) and not meta.get("reason"):
+                meta["reason"] = "invalid_unknown"
+        meta["trial_id"] = trial_id
         meta["x_c"] = x_c
         meta["z_c"] = z_c
-        trial_details[spec.name] = (slices_df, meta)
+        trial_details[trial_id] = (slices_df, meta)
+        pass_fail = "PASS" if (np.isfinite(fos) and float(fos) >= 1.0) else "FAIL"
         trial_rows.append({
-            "trial name": spec.name,
-            "centre": f"({x_c:.3f}, {z_c:.3f})",
-            "x_c": x_c,
-            "z_c": z_c,
-            "R": R,
-            "slices": int(spec.n_slices),
+            "trial_id": trial_id,
+            "centre_x": x_c,
+            "centre_y": z_c,
+            "radius": R,
             "FoS": fos,
-            "status": "valid" if np.isfinite(fos) else f"invalid ({meta.get('reason', 'unknown')})",
+            "PASS/FAIL": pass_fail,
+            "status": "valid" if np.isfinite(fos) else f"invalid ({meta.get('reason') or 'unknown'})",
         })
-    trials_df = pd.DataFrame(trial_rows)
-    valid_df = trials_df[np.isfinite(trials_df["FoS"])].copy()
-    critical_trial = None if valid_df.empty else valid_df.loc[valid_df["FoS"].idxmin()]
+    trials_df = pd.DataFrame(trial_rows).sort_values(by="FoS", ascending=True, na_position="last").reset_index(drop=True)
     geometry = {
         "ground_z": ground_z,
         "z_finish": z_finish,
@@ -1756,89 +1821,96 @@ def run_phi0_trials(df1: pd.DataFrame, x_stability: float, B_top: float, side: s
         "crest": crest,
         "side": side_name,
         "x_stability": float(x_stability),
+        "construction": construction,
+        "cu_kpa_used": float(cu_kpa),
     }
-    return trials_df, critical_trial, trial_details, geometry
+    return trials_df, trial_details, geometry
 
 
 # ---------------------------------------------------------------------------
-# Lecture construction overlay — right-triangle + 9 guide-point grid
+# Lecture construction overlay — slope line + construction box + points A..I
 # ---------------------------------------------------------------------------
-# Z3_FACTOR: the third horizontal guide level above crest expressed as
-# multiples of H.  Change only this constant if the lecture uses a different
-# third level (default = 1.50 H above crest).
-Z3_FACTOR = 1.50
-
-
 def plot_lecture_construction(ax, x_crest: float, z_crest: float,
-                               x_toe: float, z_toe: float) -> None:
+                             x_toe: float, z_toe: float,
+                             construction: dict | None = None) -> None:
     """
-    Overlay the lecture construction geometry onto *ax*:
-      A) 90° right triangle  (T → T_up → C)
-      B) 3 vertical   dashed-blue guide lines
-      C) 3 horizontal dashed-blue guide lines
-      D) 9 labelled intersection points  P1 … P9
-    Call this BEFORE drawing the selected-trial centre/radius so the
-    triangle sits underneath the circle.
+    Draw lecture construction box + 9 slip-circle centres (3×3 grid).
     """
-    H = z_crest - z_toe
-    if H <= 0.0:
+    H = float(z_crest) - float(z_toe)
+    if H <= 0:
         return
 
-    # ── A) 90° triangle ──────────────────────────────────────────────────
-    T    = (x_toe,   z_toe)
-    C    = (x_crest, z_crest)
-    T_up = (x_toe,   z_crest)
+    toe = (float(x_toe), float(z_toe))
+    crest = (float(x_crest), float(z_crest))
 
-    tri_kw = dict(color="steelblue", lw=1.2, ls="--", alpha=0.70, zorder=2)
-    ax.plot([T[0],    T_up[0]], [T[1],    T_up[1]], **tri_kw, label="_tri_v")
-    ax.plot([T_up[0], C[0]],   [T_up[1], C[1]],   **tri_kw, label="_tri_h")
-    ax.plot([C[0],    T[0]],   [C[1],    T[1]],   **tri_kw, label="_tri_s")
+    if construction is None:
+        construction = _build_slope_stability_centres(toe=toe, crest=crest, H=H)
 
-    # ── B) 3 vertical guides ─────────────────────────────────────────────
-    x_left  = x_crest
-    x_mid_g = 0.5 * (x_crest + x_toe)
-    x_right = x_toe
+    x_left = float(construction["x_left"])
+    x_right = float(construction["x_right"])
+    x_mid = float(construction["x_mid"])
+    z_bottom = float(construction["z_bottom"])
+    z_top = float(construction["z_top"])
+    z_mid = float(construction["z_mid"])
 
-    z_vbot = z_toe
-    z_vtop = z_crest + 1.25 * H
-    vkw = dict(color="steelblue", lw=1.0, ls=":", alpha=0.60, zorder=2)
-    for xv in (x_left, x_mid_g, x_right):
-        ax.plot([xv, xv], [z_vbot, z_vtop], **vkw, label="_vguide")
+    # Rectangle (construction box) — lines only, NO markers at corners
+    box_x = [x_left, x_right, x_right, x_left, x_left]
+    box_z = [z_bottom, z_bottom, z_top, z_top, z_bottom]
+    ax.plot(box_x, box_z, color="navy", lw=1.6, ls="-", alpha=0.85, zorder=2, label="construction box")
 
-    # ── C) 3 horizontal guides ───────────────────────────────────────────
-    z0   = z_crest + 0.00 * H
-    z075 = z_crest + 0.75 * H
-    z3   = z_crest + Z3_FACTOR * H
+    # Midlines (dotted)
+    ax.plot([x_mid, x_mid], [z_bottom, z_top], color="navy", lw=1.2, ls=":", alpha=0.65, zorder=2)
+    ax.plot([x_left, x_right], [z_mid, z_mid], color="navy", lw=1.2, ls=":", alpha=0.65, zorder=2)
 
-    x_span_half = 2.0 * H
-    xhmin = min(x_crest, x_toe) - x_span_half
-    xhmax = max(x_crest, x_toe) + x_span_half
-    hkw = dict(color="steelblue", lw=1.0, ls=":", alpha=0.60, zorder=2)
-    for zh in (z0, z075, z3):
-        ax.plot([xhmin, xhmax], [zh, zh], **hkw, label="_hguide")
-
-    # ── D) 9 construction points ─────────────────────────────────────────
-    x_verts = [x_left, x_mid_g, x_right]
-    z_horzs = [z0, z075, z3]
-    pnum = 1
-    for zh in z_horzs:
-        for xv in x_verts:
-            ax.plot(xv, zh, "o", color="steelblue", markersize=5,
-                    zorder=4, label="_Ppt")
-            ax.annotate(
-                f"P{pnum}",
-                xy=(xv, zh),
-                xytext=(4, 4),
-                textcoords="offset points",
-                fontsize=6,
-                color="steelblue",
-                zorder=5,
-            )
-            pnum += 1
-
-    # ── legend proxy for the whole overlay ───────────────────────────────
-    ax.plot([], [], color="steelblue", lw=1.2, ls="--",
-            label="lecture construction (triangle / guides / P1-P9)")
+    # Centres (9 points) — ONLY from construction["centres"], never corner markers
+    # Distinct colors + readable label offsets (H highlighted as active centre).
+    centre_color_map = {
+        "A": "#1f77b4",  # blue
+        "B": "#2ca02c",  # green
+        "C": "#9467bd",  # purple
+        "D": "#8c564b",  # brown
+        "E": "#17becf",  # cyan
+        "F": "#bcbd22",  # olive
+        "G": "#7f7f7f",  # grey
+        "H": "#ff2d55",  # active centre (highlighted)
+        "I": "#ff7f0e",  # orange
+    }
+    dx_map = {"F": -18, "C": 0, "G": 16, "D": -20, "A": 0, "E": 18, "H": -18, "B": 0, "I": 18}
+    dy_map = {"F": 14, "C": 16, "G": 14, "D": 2, "A": 2, "E": 2, "H": -16, "B": -18, "I": -16}
+    for c in construction["centres"]:
+        label = str(c["trial_id"])
+        xc = float(c["x"])
+        zc = float(c["z"])
+        dx = dx_map.get(label, 0)
+        dy = dy_map.get(label, 0)
+        point_color = centre_color_map.get(label, "navy")
+        marker_size = 7.0 if label == "H" else 5.8
+        marker_edge = 1.4 if label == "H" else 0.9
+        ax.plot(
+            xc,
+            zc,
+            marker="o",
+            color=point_color,
+            markeredgecolor="black",
+            markeredgewidth=marker_edge,
+            markersize=marker_size,
+            zorder=9,
+            label=f"centre {label}" if label != "H" else "centre H (active)",
+        )
+        ax.annotate(
+            label,
+            xy=(xc, zc),
+            xytext=(dx, dy),
+            textcoords="offset points",
+            fontsize=9,
+            color=point_color,
+            fontweight="bold",
+            zorder=10,
+            ha="center",
+            va="center",
+            arrowprops=dict(arrowstyle="-", color="#4a4a4a", lw=0.8, alpha=0.7),
+            bbox=dict(facecolor="white", edgecolor=point_color, alpha=0.92, pad=0.45, boxstyle="round,pad=0.25"),
+        )
 
 
 def z_surface(y: float, ground_level: float, Z_finish: float, B_top: float, B_base: float) -> float:
@@ -2484,7 +2556,7 @@ if run_btn:
             layers_df_for_x_section,
             immediate_stage_df_x_section,
         )
-        pvd_design = pvd_design_fixed_point(
+        pvd_design = sand_drain_design_fixed_point(
             Ur_target=Ur_target,
             Ch_m2_per_s=Ch_m2_per_s,
             t_design_years=t_design_years,
@@ -2519,44 +2591,20 @@ if run_btn:
             run_detailed_stage2_profile=run_detailed_stage2_profile,
         )
         if run_slope_stability and df1 is not None:
-            trial_specs = _default_phi0_trial_specs(n_slices=int(n_slices))
-            trials_df, critical_trial, trial_details, trial_geom = run_phi0_trials(
+            trials_df, trial_details, trial_geom = run_phi0_trials(
                 df1=df1,
                 x_stability=x_stability,
                 B_top=B_top,
                 side=stability_side,
-                cu_kpa=cu,
                 gamma_fill=gamma_fill,
                 gamma_clay=gamma_clay,
-                trial_specs=trial_specs,
+                n_slices=int(n_slices),
+                cu_kpa=SLOPE_STABILITY_CU_KPA,
             )
-            # Run at all chainages for the full-alignment summary table
-            _all_x = sorted(df1["x"].dropna().unique())
-            _mc_rows = []
-            for _x_ch in _all_x:
-                try:
-                    _td, _ct, _, _ = run_phi0_trials(
-                        df1=df1, x_stability=float(_x_ch), B_top=B_top,
-                        side=stability_side, cu_kpa=cu,
-                        gamma_fill=gamma_fill, gamma_clay=gamma_clay,
-                        trial_specs=trial_specs,
-                    )
-                    _row = {"chainage (m)": float(_x_ch)}
-                    for _, _tr in _td.iterrows():
-                        _fos = _tr["FoS"]
-                        _row[_tr["trial name"]] = round(float(_fos), 3) if np.isfinite(float(_fos)) else None
-                    _ct_fos = float(_ct["FoS"]) if _ct is not None else float("nan")
-                    _row["critical trial"] = _ct["trial name"] if _ct is not None else "—"
-                    _row["min FoS"] = round(_ct_fos, 3) if np.isfinite(_ct_fos) else None
-                    _mc_rows.append(_row)
-                except Exception:
-                    pass
             slope_stab_result = {
                 "trials_df": trials_df,
-                "critical_trial": None if critical_trial is None else critical_trial.to_dict(),
                 "trial_details": trial_details,
                 "geometry": trial_geom,
-                "multi_chainage_df": pd.DataFrame(_mc_rows) if _mc_rows else pd.DataFrame(),
             }
         x0_summary = summarize_x0_settlement_and_consolidation(layer_table_x0, week2_chainage_df)
     csv_note = ""
@@ -2564,11 +2612,67 @@ if run_btn:
         csv_note = " | CSV: " + ", ".join([os.path.basename(p) for p in csv_paths.values()])
     st.success("Done. Excel saved to " + str(out_path) + csv_note)
 
+left_col, right_col = st.columns([1, 3], gap="large")
+
+with left_col:
+    st.subheader("Inputs & Run")
+    with st.expander("Global inputs (read-only)", expanded=False):
+        global_inputs_df = build_input_summary_df([
+            {"Parameter": "Alignment length", "Symbol": "L", "Value": float(L), "Units": "m"},
+            {"Parameter": "Chainage step", "Symbol": "dx", "Value": float(dx), "Units": "m"},
+            {"Parameter": "Top width", "Symbol": "B_top", "Value": float(B_top), "Units": "m"},
+            {"Parameter": "Side slope", "Symbol": "m", "Value": float(m), "Units": "H:1V"},
+            {"Parameter": "Crown chainage", "Symbol": "x_c", "Value": float(x_c), "Units": "m"},
+            {"Parameter": "Flood level", "Symbol": "Z_flood", "Value": float(flood_level), "Units": "mAOD"},
+            {"Parameter": "Freeboard", "Symbol": "fb", "Value": float(freeboard), "Units": "m"},
+            {"Parameter": "Grade", "Symbol": "g", "Value": float(grade), "Units": "m/m"},
+            {"Parameter": "Fill unit weight", "Symbol": "gamma_fill", "Value": float(gamma_fill), "Units": "kN/m^3"},
+            {"Parameter": "Clay unit weight", "Symbol": "gamma_clay", "Value": float(gamma_clay), "Units": "kN/m^3"},
+            {"Parameter": "Water unit weight", "Symbol": "gamma_w", "Value": float(gamma_w), "Units": "kN/m^3"},
+            {"Parameter": "Load factor", "Symbol": "gamma_F", "Value": 1.35, "Units": "-"},
+            {"Parameter": "Material factor", "Symbol": "gamma_M", "Value": 1.40, "Units": "-"},
+        ])
+        st.table(global_inputs_df)
+
+    with st.container(border=True):
+        st.markdown("**Run status**")
+        st.caption(f"Run generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        if df1 is None:
+            st.caption("- Waiting for run results.")
+        else:
+            st.caption(f"- Max settlement: {float(df1['rho'].max()):.4f} m")
+            st.caption(f"- Max Z_construct: {float(df1['Z_rev'].max()):.3f} mAOD")
+
 if df1 is not None:
+    _st_module = st
+    st = _StreamlitColumnProxy(right_col, _st_module)
     # -------------------------------------------------------------------------
     # 1) Geometry & Profiles
     # -------------------------------------------------------------------------
     st.header("Geometry & Profiles")
+    with st.container(border=True):
+        st.markdown("**Key results**")
+        gk1, gk2, gk3, gk4 = st.columns(4)
+        gk1.metric("Max H_fill (m)", f"{df1['H_fill'].max():.3f}")
+        gk2.metric("Max B_base (m)", f"{df1['B_base'].max():.3f}")
+        gk3.metric("Max Z_finish (mAOD)", f"{df1['Z_finish'].max():.3f}")
+        gk4.metric("End Z_finish at x=1000 (mAOD)", f"{float(df1.loc[(df1['x'] - 1000.0).abs().idxmin(), 'Z_finish']):.3f}")
+    with st.expander("Inputs used (read-only)", expanded=False):
+        geometry_inputs_section_df = build_input_summary_df([
+            {"Parameter": "Length", "Symbol": "L", "Value": float(L), "Units": "m"},
+            {"Parameter": "Chainage spacing", "Symbol": "dx", "Value": float(dx), "Units": "m"},
+            {"Parameter": "Ground level at A", "Symbol": "ground_A", "Value": float(ground_A), "Units": "mAOD"},
+            {"Parameter": "Ground level at B", "Symbol": "ground_B", "Value": float(ground_B), "Units": "mAOD"},
+            {"Parameter": "Crown chainage", "Symbol": "x_c", "Value": float(x_c), "Units": "m"},
+            {"Parameter": "Bedrock at crown", "Symbol": "bedrock_c", "Value": float(bedrock_c), "Units": "mAOD"},
+            {"Parameter": "Top width", "Symbol": "B_top", "Value": float(B_top), "Units": "m"},
+            {"Parameter": "Side slope", "Symbol": "m", "Value": float(m), "Units": "H:1V"},
+            {"Parameter": "Flood level", "Symbol": "Z_flood", "Value": float(flood_level), "Units": "mAOD"},
+            {"Parameter": "Freeboard", "Symbol": "fb", "Value": float(freeboard), "Units": "m"},
+            {"Parameter": "Target crown finish", "Symbol": "Z_peak_finish", "Value": float(Z_peak_finish), "Units": "mAOD"},
+            {"Parameter": "Grade", "Symbol": "g", "Value": float(grade), "Units": "m/m"},
+        ])
+        st.dataframe(geometry_inputs_section_df, use_container_width=True, hide_index=True)
     st.subheader("Longitudinal Profile")
     fig1, ax1 = plt.subplots(figsize=(10, 5))
     x_vals = df1["x"].values
@@ -2734,12 +2838,25 @@ if df1 is not None:
         st.latex(r"H_0 = \text{ground} - \text{bedrock}")
         st.latex(r"Z_{\text{finish}}(x) = Z_{\text{peak}} - g|x - x_c|,\ \text{then shift if min} < Z_{\min,\text{finish}}")
         st.latex(r"H_{\text{fill}} = \max(0,\ Z_{\text{finish}} - \text{ground})")
+    with st.expander("Details — full results table", expanded=False):
+        st.dataframe(
+            df1[["x", "ground level", "bedrock level", "Z_finish", "H_fill", "B_base", "A_trap", "q_equiv"]],
+            use_container_width=True,
+            hide_index=True,
+        )
     st.caption("**Values carried forward →** H₀, H_fill, Z_finish passed to Loading/Settlement")
 
     # -------------------------------------------------------------------------
     # 2) Loading & Stress Increment
     # -------------------------------------------------------------------------
-    st.header("Loading & Stress Increment")
+    st.subheader("Loading & Stress Increment")
+    with st.container(border=True):
+        st.markdown("**Key results — Loading & Stress Increment**")
+        lk1, lk2, lk3, lk4 = st.columns(4)
+        lk1.metric("Max q_equiv (kPa)", f"{df1['q_equiv'].max():.3f}")
+        lk2.metric("Chainage at max q (m)", f"{float(df1.loc[df1['q_equiv'].astype(float).idxmax(), 'x']):.1f}")
+        lk3.metric("End q at x=1000 (kPa)", f"{float(df1.loc[(df1['x'] - 1000.0).abs().idxmin(), 'q_equiv']):.3f}")
+        lk4.metric("End H_fill at x=1000 (m)", f"{float(df1.loc[(df1['x'] - 1000.0).abs().idxmin(), 'H_fill']):.3f}")
     st.subheader("Design vs Construction (same chainage)")
     H_fill_design = float(r["Z_finish"]) - ground_lev
     H_fill_construct = (float(r["Z_finish"]) + rho_total_sec) - ground_lev
@@ -2797,19 +2914,33 @@ if df1 is not None:
             st.warning("Edge and centre total settlements are identical at all clay chainages. Check Craig-strip x offset wiring if this was not intended.")
 
     # -------------------------------------------------------------------------
-    # 3) Settlement Results
+    # 3) Settlement (Primary Consolidation)
     # -------------------------------------------------------------------------
-    st.header("Settlement Results")
+    st.header("Settlement (Primary Consolidation)")
     if monotonic_warnings:
         st.warning("Settlement should increase with higher fill; monotonicity failed for some cases (see Detailed tables).")
-    c_s1, c_s2 = st.columns(2)
-    with c_s1:
-        st.metric("Max ρ_i (m)", f"{df1['rho_i'].max():.4f}")
-        st.metric("Max ρ_c (m)", f"{df1['rho_c'].max():.4f}")
-        st.metric("Max ρ_total (m)", f"{df1['rho'].max():.4f}")
-        st.metric("Max Z_construct (mAOD)", f"{df1['Z_rev'].max():.3f}")
-    with c_s2:
+    with st.container(border=True):
+        st.markdown("**Key results**")
+        c_s1, c_s2, c_s3, c_s4 = st.columns(4)
+        c_s1.metric("Worst ρ_i (m)", f"{df1['rho_i'].max():.4f}")
+        c_s2.metric("Worst ρ_c (m)", f"{df1['rho_c'].max():.4f}")
+        c_s3.metric("Worst ρ_total (m)", f"{df1['rho'].max():.4f}")
+        c_s4.metric("End ρ_total at x=1000 (m)", f"{float(df1.loc[(df1['x'] - 1000.0).abs().idxmin(), 'rho']):.4f}")
         st.caption("ρ_i is currently assumed the same at centre and edge; only ρ_c varies by Craig-strip x offset.")
+    with st.expander("Inputs used (read-only)", expanded=False):
+        settlement_inputs_section_df = build_input_summary_df([
+            {"Parameter": "Fill unit weight", "Symbol": "gamma_fill", "Value": float(gamma_fill), "Units": "kN/m^3"},
+            {"Parameter": "Clay unit weight", "Symbol": "gamma_clay", "Value": float(gamma_clay), "Units": "kN/m^3"},
+            {"Parameter": "Water unit weight", "Symbol": "gamma_w", "Value": float(gamma_w), "Units": "kN/m^3"},
+            {"Parameter": "Settlement model", "Symbol": "-", "Value": str(consol_method), "Units": ""},
+            {"Parameter": "m_v", "Symbol": "m_v", "Value": float(m_v), "Units": "m^2/kN"},
+            {"Parameter": "Compression index", "Symbol": "Cc", "Value": float(Cc), "Units": "-"},
+            {"Parameter": "Initial void ratio", "Symbol": "e0", "Value": float(e0), "Units": "-"},
+            {"Parameter": "Immediate factor", "Symbol": "I_s", "Value": float(Is), "Units": "-"},
+            {"Parameter": "Stiffness ratio", "Symbol": "E_u/c_u", "Value": float(Eu_over_cu), "Units": "-"},
+            {"Parameter": "Delta sigma mode", "Symbol": "-", "Value": str(delta_sigma_mode), "Units": ""},
+        ])
+        st.dataframe(settlement_inputs_section_df, use_container_width=True, hide_index=True)
 
     st.subheader("3D post-settlement road surface (Stage-2 detailed)")
     with st.spinner("Computing Stage-2 detailed post-settlement surface on toe-to-toe η grid..."):
@@ -2898,7 +3029,7 @@ if df1 is not None:
     ax_sett_3d.set_title("3D post-settlement road surface (Stage-2 detailed)")
     ax_sett_3d.view_init(elev=25, azim=-65)
     plt.tight_layout()
-    evidence_debug = st.expander("Evidence / Debug (lecturer)", expanded=False)
+    evidence_debug = st.expander("Details — settlement evidence and debug", expanded=False)
     evidence_debug.pyplot(fig_sett_3d, use_container_width=True)
     plt.close(fig_sett_3d)
     evidence_debug.caption("Assumption: immediate settlement ρ_i is laterally constant; across-width variation comes from Craig-strip consolidation Δσ(y).")
@@ -3201,312 +3332,611 @@ if df1 is not None:
         st.caption(note)
 
     # -------------------------------------------------------------------------
-    # 4) Consolidation Time (Vertical + PVD combined)
+    # 4) Consolidation Time (Vertical + sand drain combined)
     # -------------------------------------------------------------------------
     st.header("Consolidation Time")
     if pvd_design is not None:
         s_check_delta = float(pvd_design["S_m"]) - 3.374
         st.info(
-            "PVD design summary "
+            "Sand drain design summary "
             f"(pattern={pattern}): Ur_target={Ur_target:.5f}, t_design={t_design_years:.2f} y, "
             f"Ch={Ch_m2_per_s:.2e} m²/s, rd={rd_m:.3f} m | "
             f"n={float(pvd_design['n_final']):.3f}, R={float(pvd_design['R_m']):.3f} m, "
             f"De={float(pvd_design['De_m']):.3f} m, S={float(pvd_design['S_m']):.3f} m "
             f"(check vs 3.374 m: Δ={s_check_delta:+.4f} m)"
         )
-    st.subheader("Consolidation Time (Vertical)")
+    with st.container(border=True):
+        st.markdown("**Key results**")
+        c_t90_1, c_t90_2, c_t90_3, c_t90_4 = st.columns(4)
+        st.subheader("Consolidation Time (Vertical)")
+        t90_col = "U90_t_years"
+        if t90_col in week2_chainage_df.columns:
+            i_max = week2_chainage_df[t90_col].astype(float).idxmax()
+            rmax = week2_chainage_df.loc[i_max]
+            c_t90_1.metric("Worst vertical t90 (years)", f"{float(rmax[t90_col]):.2f}")
+            c_t90_2.metric("Chainage at worst vertical t90 (m)", f"{float(rmax['x']):.1f}")
+        if week2_chainage_pvd_df is not None and len(week2_chainage_pvd_df) > 0 and t90_col in week2_chainage_df.columns:
+            i_max_p = week2_chainage_pvd_df[t90_col].astype(float).idxmax()
+            rmax_p = week2_chainage_pvd_df.loc[i_max_p]
+            t90_v = float(week2_chainage_df.loc[i_max, t90_col])
+            t90_p = float(rmax_p[t90_col])
+            c_t90_3.metric("Worst-case Sand Drain combined t90 (years)", f"{t90_p:.2f}")
+            speedup = t90_v / t90_p if t90_p > 0.0 else float("inf")
+            c_t90_4.metric("Speed-up factor vertical / sand drain combined", f"{speedup:.2f}x")
+    with st.expander("Inputs used (read-only)", expanded=False):
+        consolidation_inputs_section_df = build_input_summary_df([
+            {"Parameter": "Cv", "Symbol": "Cv", "Value": float(Cv_m2_per_s), "Units": "m^2/s"},
+            {"Parameter": "Vertical drainage", "Symbol": "-", "Value": str(vertical_drainage), "Units": ""},
+            {"Parameter": "Uv targets", "Symbol": "U", "Value": str(Uv_targets_str), "Units": "-"},
+            {"Parameter": "Ur target", "Symbol": "Ur", "Value": float(Ur_target), "Units": "-"},
+            {"Parameter": "Design time", "Symbol": "t_design", "Value": float(t_design_years), "Units": "years"},
+            {"Parameter": "Ch", "Symbol": "Ch", "Value": float(Ch_m2_per_s), "Units": "m^2/s"},
+            {"Parameter": "Drain radius", "Symbol": "rd", "Value": float(rd_m), "Units": "m"},
+            {"Parameter": "Pattern", "Symbol": "-", "Value": str(pattern), "Units": ""},
+        ])
+        st.dataframe(consolidation_inputs_section_df, use_container_width=True, hide_index=True)
     t90_col = "U90_t_years"
     if t90_col in week2_chainage_df.columns:
         i_max = week2_chainage_df[t90_col].astype(float).idxmax()
         rmax = week2_chainage_df.loc[i_max]
-        st.metric("Worst-case t90 (years)", f"{float(rmax[t90_col]):.2f}")
-        st.caption(f"Occurs at x = {float(rmax['x']):.1f} m")
         if float(rmax[t90_col]) > 5.0:
             st.warning("t90 > 5 years: long-term consolidation settlement likely (programme risk).")
-    st.dataframe(week2_chainage_df, use_container_width=True, hide_index=True)
+    with st.expander("Details — consolidation vertical table", expanded=False):
+        st.dataframe(week2_chainage_df, use_container_width=True, hide_index=True)
     if week2_chainage_pvd_df is not None and len(week2_chainage_pvd_df) > 0:
-        st.subheader("Consolidation Time (PVD combined)")
+        st.subheader("Consolidation Time (Sand drain combined)")
         t90_col_pvd = "U90_t_years"
-        if t90_col_pvd in week2_chainage_pvd_df.columns and t90_col in week2_chainage_df.columns:
-            i_max_v = week2_chainage_df[t90_col].astype(float).idxmax()
-            i_max_p = week2_chainage_pvd_df[t90_col_pvd].astype(float).idxmax()
-            t90_v = float(week2_chainage_df.loc[i_max_v, t90_col])
-            t90_p = float(week2_chainage_pvd_df.loc[i_max_p, t90_col_pvd])
-            c_t90_1, c_t90_2, c_t90_3 = st.columns(3)
-            c_t90_1.metric("Worst-case vertical t90 (years)", f"{t90_v:.2f}")
-            c_t90_2.metric("Worst-case PVD combined t90 (years)", f"{t90_p:.2f}")
-            speedup = t90_v / t90_p if t90_p > 0.0 else float("inf")
-            c_t90_3.metric("Speed-up factor (vertical/PVD)", f"{speedup:.2f}x")
-        st.dataframe(
-            week2_chainage_pvd_df,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Cv_m2_per_s": st.column_config.NumberColumn("Cv_m2_per_s", format="%.1e"),
-                "Ch_m2_per_s": st.column_config.NumberColumn("Ch_m2_per_s", format="%.1e"),
-            },
-        )
+        with st.expander("Details — consolidation Sand drain table", expanded=False):
+            st.dataframe(
+                week2_chainage_pvd_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Cv_m2_per_s": st.column_config.NumberColumn("Cv_m2_per_s", format="%.1e"),
+                    "Ch_m2_per_s": st.column_config.NumberColumn("Ch_m2_per_s", format="%.1e"),
+                },
+            )
     with st.expander("Formulas used", expanded=False):
         st.latex(r"T_v = \frac{C_v \, t}{H_d^2} \implies t = \frac{T_v \, H_d^2}{C_v}")
         st.markdown(r"**U(T_v) series:** $U = 1 - \sum_{n=0}^{\infty}\frac{8}{\pi^2(2n+1)^2}e^{-(2n+1)^2\pi^2 T_v/4}$")
         st.caption("Tv(U) solved by bisection (80-term truncation).")
         st.latex(r"H_d = H_0 \text{ (single drainage)} \quad \text{or} \quad H_d = H_0/2 \text{ (double drainage)}")
-        st.markdown(r"**PVD radial (Barron equal strain):** $U_r=1-\exp(-8T_r/F)$, with $T_r=\frac{C_h t}{D_e^2}$ and $F=\ln(n)-0.75$")
+        st.markdown(r"**Sand-drain radial (lecture table):** $s^2=\pi R^2,\ n=R/r_d,\ t=\frac{4r_d^2\,T_R(n,U_r)\,n^2}{C_h}$")
         st.markdown(r"**Combined:** $U=1-(1-U_v)(1-U_r)$")
     st.caption("**Values carried forward →** Tv and t_years for U20/U50/U90")
 
+    if week2_chainage_pvd_df is not None and len(week2_chainage_pvd_df) > 0 and df1 is not None and len(df1) > 0:
+        with st.expander("Sand drain layout (plan view)", expanded=False):
+            x_min = float(df1["x"].min())
+            x0_plan = x_min
+            slice_length_m = 100.0
+            spacing_plan = float(pvd_design["S_m"]) if pvd_design else 3.374
+            rd_plan = float(rd_m)
+            margin_plan = 0.5
+            st.caption(
+                f"Fixed inputs: x0={x0_plan:.1f} m, slice={slice_length_m:.1f} m, "
+                f"s={spacing_plan:.2f} m, rd={rd_plan:.2f} m, margin={margin_plan:.2f} m."
+            )
+            i0_plan = int((df1["x"].astype(float) - float(x0_plan)).abs().idxmin())
+            width_plan = float(df1.loc[i0_plan, "B_base"])
+            motorway_width_plan = float(B_top)
+            fig_plan = plot_sand_drains_plan_view(
+                length_m=float(slice_length_m),
+                width_m=width_plan,
+                spacing_s=float(spacing_plan),
+                rd=float(rd_plan),
+                margin=float(margin_plan),
+                title=f"Sand drain plan view at x≈{float(df1.loc[i0_plan, 'x']):.1f} m, base width={width_plan:.2f} m",
+                motorway_width_m=motorway_width_plan,
+            )
+            st.caption(
+                f"Drain placement band is motorway width B_top={motorway_width_plan:.2f} m "
+                f"inside embankment base width B_base={width_plan:.2f} m."
+            )
+            st.pyplot(fig_plan, use_container_width=True)
+
     # -------------------------------------------------------------------------
-    # 5) Slope Stability (Short-term Undrained)
+    # 5) Bearing Capacity (Undrained, Short-Term)
     # -------------------------------------------------------------------------
-    st.header("Slope Stability (Short-term Undrained)")
+    st.header("Bearing Capacity (Undrained, Short-Term)")
+
+    bearing_cols = [
+        "x",
+        "z_ref_m",
+        "h_fill_m",
+        "p_kPa",
+        "Ed_kPa",
+        "Cu_kPa",
+        "Cu_d_kPa",
+        "qs_kPa",
+        "utilisation",
+        "Cu_req_user_kPa",
+        "Cu_req_consistent_kPa",
+    ]
+    try:
+        # Explicit non-mutating mapping from the main chainage dataframe.
+        mapped_df = pd.DataFrame()
+        mapped_df["x"] = df1["x"]
+        mapped_df["H_fill"] = df1["H_fill"]
+        mapped_df["H0"] = df1["H0"]
+        mapped_df["B_base"] = df1["B_base"]
+
+        alpha_z = 0.5
+        bearing_z_mode = "at_ref"
+        z_profile_max = float(CU_PROFILE_Z_MAX_M)
+
+        z_ref_raw = alpha_z * pd.to_numeric(mapped_df["B_base"], errors="coerce")
+        H0_numeric = pd.to_numeric(mapped_df["H0"], errors="coerce")
+
+        # z_ref_used cannot exceed clay thickness or available Cu profile depth
+        z_ref_series = np.minimum(np.minimum(z_ref_raw, H0_numeric), z_profile_max)
+
+        df_bear = compute_bearing_capacity_table(
+            mapped_df,
+            gamma_fill_kN_m3=20.0,
+            gamma_f=1.35,
+            Nc=5.14,
+            gamma_M=1.4,
+            z_ref_m=5.0,
+            z_mode=bearing_z_mode,
+            z_ref_series=z_ref_series,
+        )
+
+        if len(df_bear) > 0 and df_bear["utilisation"].notna().any():
+            idx_worst_bear = df_bear["utilisation"].astype(float).idxmax()
+            row_worst_bear = df_bear.loc[idx_worst_bear]
+            with st.container(border=True):
+                st.markdown("**Key results**")
+                bc_m1, bc_m2, bc_m3, bc_m4 = st.columns(4)
+                bc_m1.metric("Worst utilisation", f"{float(row_worst_bear['utilisation']):.3f}")
+                bc_m2.metric("Chainage at worst utilisation (m)", f"{float(row_worst_bear['x']):.1f}")
+                bc_m3.metric("End utilisation at x=1000", f"{float(df_bear.loc[(df_bear['x'] - 1000.0).abs().idxmin(), 'utilisation']):.3f}")
+                bc_m4.metric("Status", "FAIL" if float(row_worst_bear["utilisation"]) > 1.0 else "PASS")
+        else:
+            st.info("No valid bearing-capacity utilisation values were computed.")
+
+        with st.expander("Inputs used (read-only)", expanded=False):
+            bearing_inputs_section_df = build_input_summary_df([
+                {"Parameter": "Fill unit weight", "Symbol": "gamma_fill", "Value": 20.0, "Units": "kN/m^3"},
+                {"Parameter": "Load factor", "Symbol": "gamma_F", "Value": 1.35, "Units": "-"},
+                {"Parameter": "Material factor", "Symbol": "gamma_M", "Value": 1.40, "Units": "-"},
+                {"Parameter": "Bearing factor", "Symbol": "N_c", "Value": 5.14, "Units": "-"},
+                {"Parameter": "Cu(z) profile", "Symbol": "-", "Value": "piecewise linear interpolation", "Units": ""},
+                {"Parameter": "z_ref used for Cu", "Symbol": "z_ref", "Value": 5.0, "Units": "m"},
+                {"Parameter": "Cu selection mode", "Symbol": "-", "Value": bearing_z_mode, "Units": ""},
+                {"Parameter": "z_ref(x) = α · B_base(x)", "Symbol": "α", "Value": 0.5, "Units": "-"},
+            ])
+            st.dataframe(bearing_inputs_section_df, use_container_width=True, hide_index=True)
+
+        def _style_bearing_fail_rows(row):
+            try:
+                fail = float(row["utilisation"]) > 1.0
+            except Exception:
+                fail = False
+            if fail:
+                return ["background-color: #ffe6e6"] * len(row)
+            return [""] * len(row)
+
+        if len(df_bear) > 0 and df_bear["utilisation"].notna().any():
+            worst_check_df = pd.DataFrame(
+                [
+                    {
+                        "x": float(row_worst_bear["x"]),
+                        "H_fill": float(row_worst_bear["h_fill_m"]),
+                        "p_kPa": float(row_worst_bear["p_kPa"]),
+                        "Ed_kPa": float(row_worst_bear["Ed_kPa"]),
+                        "Cu_kPa": float(row_worst_bear["Cu_kPa"]),
+                        "Cu_d_kPa": float(row_worst_bear["Cu_d_kPa"]),
+                        "qs_kPa": float(row_worst_bear["qs_kPa"]),
+                        "utilisation": float(row_worst_bear["utilisation"]),
+                    }
+                ]
+            )
+        with st.expander("Details — bearing capacity table", expanded=False):
+            mode_compare_df = pd.DataFrame([
+                {"Mode": "at_ref", "z_ref_m": 5.0, "Cu_kPa": cu_at_depth_kpa(5.0)},
+                {"Mode": "min_0_to_ref", "z_ref_m": 5.0, "Cu_kPa": cu_min_over_depth_kpa(5.0)},
+            ])
+            st.caption("Cu used for bearing check under each selection mode (read-only).")
+            st.dataframe(mode_compare_df, use_container_width=True, hide_index=True)
+
+            z_max = 20.0
+            dz = 0.5
+            z_vals = np.arange(0.0, z_max + 1e-9, dz)
+            cu_profile_check_df = pd.DataFrame(
+                {
+                    "z_m": z_vals,
+                    "Cu_kPa": [cu_at_depth_kpa(float(z)) for z in z_vals],
+                }
+            )
+            st.caption("Cu profile check (interpolated Cu at selected depths)")
+            st.dataframe(cu_profile_check_df, use_container_width=True, hide_index=True)
+            z_ref_numeric = pd.to_numeric(df_bear["z_ref_m"], errors="coerce")
+            cu_numeric = pd.to_numeric(df_bear["Cu_kPa"], errors="coerce")
+            st.caption(
+                f"z_ref_raw range across chainage: min={float(z_ref_raw.min()):.3f} m, "
+                f"max={float(z_ref_raw.max()):.3f} m"
+            )
+            st.caption(
+                f"z_ref_used range across chainage: min={float(z_ref_numeric.min()):.3f} m, "
+                f"max={float(z_ref_numeric.max()):.3f} m (<= {z_profile_max:.3f} m)"
+            )
+            st.caption(f"Acceptance check — z_ref_used max <= z_profile_max: {bool(float(z_ref_numeric.max()) <= z_profile_max)}")
+            st.caption("Cu(z) is only defined to z_profile_max; depths beyond this would clamp to Cu(z_profile_max). We therefore cap z_ref_used.")
+            st.caption(
+                f"Cu range across chainage: min={float(cu_numeric.min()):.3f} kPa, "
+                f"max={float(cu_numeric.max()):.3f} kPa"
+            )
+            st.caption(
+                "Acceptance check — Cu range is not all 25: "
+                f"{not (float(cu_numeric.min()) == 25.0 and float(cu_numeric.max()) == 25.0)}"
+            )
+            st.dataframe(
+                df_bear[bearing_cols].style.apply(_style_bearing_fail_rows, axis=1),
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.caption("Rows highlighted in red have utilisation > 1.0.")
+        if len(df_bear) > 0 and df_bear["utilisation"].notna().any():
+            with st.expander("Details — layer usage for worst-case chainage", expanded=False):
+                z_profile_max = max(z for z, cu in CU_PROFILE_POINTS)
+                idx_worst = (df1["x"] - float(row_worst_bear["x"])).abs().idxmin()
+                z_ref_raw = float(row_worst_bear["z_ref_m"])
+                H0_wc_from_row = row_worst_bear.get("H0", np.nan)
+                if pd.isna(H0_wc_from_row):
+                    H0_wc = float(df1.loc[idx_worst, "H0"])
+                else:
+                    H0_wc = float(H0_wc_from_row)
+                z_ref_wc = float(min(z_ref_raw, H0_wc, CU_PROFILE_Z_MAX_M))
+                z_ref_used = z_ref_wc
+                mode_used = bearing_z_mode
+                z_vals = np.arange(0.0, z_ref_used + 1e-9, 0.5)
+                cu_vals = [cu_at_depth_kpa(float(z)) for z in z_vals]
+                layer_df = pd.DataFrame({"z_m": z_vals, "Cu_kPa": cu_vals})
+                layer_df["included_in_check"] = True
+                layer_df["Cu_min_so_far_kPa"] = layer_df["Cu_kPa"].cummin()
+                layer_df["Cu_avg_so_far_kPa"] = layer_df["Cu_kPa"].expanding().mean()
+
+                if mode_used == "at_ref":
+                    Cu_used = cu_at_depth_kpa(z_ref_used)
+                elif mode_used == "min_0_to_ref":
+                    Cu_used = float(layer_df["Cu_kPa"].min())
+                elif mode_used == "avg_0_to_ref":
+                    Cu_used = float(layer_df["Cu_kPa"].mean())
+                else:
+                    Cu_used = float("nan")
+
+                st.caption(f"Worst-case chainage x = {row_worst_bear['x']:.1f} m")
+                st.caption(f"z_ref_raw = {z_ref_raw:.3f} m")
+                st.caption(f"H0_wc = {H0_wc:.3f} m")
+                st.caption(f"z_profile_max = {z_profile_max:.3f} m")
+                st.caption(f"z_ref_used = {z_ref_used:.3f} m")
+                st.caption("Depths beyond z_profile_max would clamp Cu to the last value (interp). We cap to avoid this.")
+                st.caption(f"Mode = {mode_used} → Cu_used = {Cu_used:.3f} kPa")
+                st.dataframe(layer_df.head(20), use_container_width=True, hide_index=True)
+                st.dataframe(layer_df.tail(20), use_container_width=True, hide_index=True)
+                show_full_depth_table = st.checkbox("Show full depth table", value=False, key="bearing_full_depth_table")
+                if show_full_depth_table:
+                    st.dataframe(layer_df, use_container_width=True, hide_index=True)
+        if len(df_bear) > 0 and df_bear["utilisation"].notna().any():
+            with st.expander("Details — worst-case row check", expanded=False):
+                st.dataframe(worst_check_df, use_container_width=True, hide_index=True)
+        with st.expander("Formulas used", expanded=False):
+            st.latex(r"p=\gamma_{fill}\,H_{fill}")
+            st.latex(r"E_d=\gamma_F\,p")
+            st.latex(r"C_{u,d}=C_u/\gamma_M")
+            st.latex(r"q_s=N_c\,C_{u,d}")
+            st.latex(r"utilisation=E_d/q_s")
+    except KeyError as exc:
+        st.error(f"Bearing capacity mapping failed due to missing source column: {exc}")
+    except ValueError as exc:
+        st.error(f"Bearing capacity calculation input error: {exc}")
+
+    # -------------------------------------------------------------------------
+    # 6) Slope Stability (Undrained Circular Slip)
+    # -------------------------------------------------------------------------
+    st.header("Slope Stability (Undrained Circular Slip)")
+    with st.expander("Inputs used (read-only)", expanded=False):
+        slope_inputs_section_df = build_input_summary_df([
+            {"Parameter": "Run slope stability", "Symbol": "-", "Value": bool(run_slope_stability), "Units": ""},
+            {"Parameter": "Side", "Symbol": "-", "Value": str(stability_side), "Units": ""},
+            {"Parameter": "x_stability", "Symbol": "x", "Value": float(x_stability), "Units": "m"},
+            {"Parameter": "Undrained shear strength (slope section fixed)", "Symbol": "c_u", "Value": float(SLOPE_STABILITY_CU_KPA), "Units": "kPa"},
+            {"Parameter": "Fill unit weight", "Symbol": "gamma_fill", "Value": float(gamma_fill), "Units": "kN/m^3"},
+            {"Parameter": "Clay unit weight", "Symbol": "gamma_clay", "Value": float(gamma_clay), "Units": "kN/m^3"},
+            {"Parameter": "Slices", "Symbol": "n", "Value": int(n_slices), "Units": "-"},
+            {"Parameter": "Minimum FoS required", "Symbol": "FoS_min", "Value": float(min_FOS_required), "Units": "-"},
+        ])
+        st.dataframe(slope_inputs_section_df, use_container_width=True, hide_index=True)
     if not run_slope_stability:
         st.info("Slope stability is OFF. Tick 'Run slope stability analysis' in the sidebar and click Run to compute.")
     elif slope_stab_result is None:
         st.warning("Slope stability was not run in the last calculation. Ensure the checkbox is enabled and click Run.")
     else:
         trials_df = slope_stab_result.get("trials_df", pd.DataFrame())
-        critical_trial = slope_stab_result.get("critical_trial")
         trial_details = slope_stab_result.get("trial_details", {})
         geom = slope_stab_result.get("geometry", {})
-        mc_df = slope_stab_result.get("multi_chainage_df", pd.DataFrame())
-
         if trials_df.empty:
             st.error("No slope stability trials were generated.")
         else:
-            # ── geometry shared by all sub-sections ────────────────────────────
-            side_name   = geom.get("side", "Right")
-            ground_z    = float(geom.get("ground_z", 0.0))
-            z_finish    = float(geom.get("z_finish", 0.0))
-            B_base      = float(geom.get("B_base", 0.0))
-            B_top_plot  = float(geom.get("B_top", B_top))
-            toe         = geom.get("toe",   (B_base / 2.0, ground_z))
-            crest       = geom.get("crest", (B_top_plot / 2.0, z_finish))
-            H_emb       = float(geom.get("H", 1.0))
-            half_w      = max(80.0, B_base / 2.0 + max(25.0, 4.5 * max(1.0, H_emb)))
-            x_plot      = np.linspace(-half_w, half_w, 300)
-            z_plot      = np.array([z_surface_half(x, ground_z, z_finish, side_name, B_top_plot, B_base)
-                                    for x in x_plot])
+            side_name = geom.get("side", "Right")
+            ground_z = float(geom.get("ground_z", 0.0))
+            z_finish = float(geom.get("z_finish", 0.0))
+            B_base = float(geom.get("B_base", 0.0))
+            B_top_plot = float(geom.get("B_top", B_top))
+            toe = geom.get("toe", (B_base / 2.0, ground_z))
+            crest = geom.get("crest", (B_top_plot / 2.0, z_finish))
+            H_emb = float(geom.get("H", 1.0))
+            construction = geom.get("construction", {})
+            cu_used = float(geom.get("cu_kpa_used", SLOPE_STABILITY_CU_KPA))
 
-            # ── per-trial colour palette ────────────────────────────────────────
-            _TRIAL_COLOURS = ["#e41a1c", "#ff7f00", "#4daf4a",
-                               "#984ea3", "#377eb8", "#a65628"]
-            trial_names = trials_df["trial name"].tolist()
-            _col = {n: _TRIAL_COLOURS[i % len(_TRIAL_COLOURS)]
-                    for i, n in enumerate(trial_names)}
-
-            # ══════════════════════════════════════════════════════════════════
-            # A) All-trials FoS summary (metric row)
-            # ══════════════════════════════════════════════════════════════════
-            st.subheader(f"All Trials — x = {x_stability:.0f} m")
-
-            _crit_name = critical_trial["trial name"] if critical_trial is not None else None
-            _cols = st.columns(len(trial_names))
-            for _col_ui, (_, _tr) in zip(_cols, trials_df.iterrows()):
-                _fos = _tr["FoS"]
-                _is_crit = _tr["trial name"] == _crit_name
-                _label = ("★ " if _is_crit else "") + _tr["trial name"]
-                if np.isfinite(float(_fos)):
-                    _delta = ("critical" if _is_crit else
-                              ("✓ Pass" if float(_fos) >= min_FOS_required else "✗ Fail"))
-                    _col_ui.metric(_label, f"{float(_fos):.3f}", delta=_delta)
+            trial_ids = trials_df["trial_id"].astype(str).tolist()
+            if trial_ids:
+                fos_series_for_pick = pd.to_numeric(trials_df["FoS"], errors="coerce")
+                if fos_series_for_pick.notna().any():
+                    governing_idx = int(fos_series_for_pick.idxmin())
+                    selected_trial_for_slices = str(trials_df.loc[governing_idx, "trial_id"])
                 else:
-                    _col_ui.metric(_label, "—", delta=str(_tr.get("status", "invalid")))
-
-            if critical_trial is not None:
-                min_FOS = float(critical_trial["FoS"])
-                pass_fail = "✓ Pass" if min_FOS >= min_FOS_required else "✗ Fail"
-                st.markdown(
-                    f"**Critical trial:** {critical_trial['trial name']} &nbsp;|&nbsp; "
-                    f"**FoS = {min_FOS:.3f}** &nbsp;|&nbsp; {pass_fail} &nbsp;|&nbsp; "
-                    f"R = {critical_trial['R']:.3f} m"
-                )
+                    selected_trial_for_slices = str(trial_ids[0])
             else:
-                st.error("No valid trial found (check centre descriptors or geometry constraints such as R ≤ 4H).")
+                selected_trial_for_slices = "A"
+            st.caption(f"Slice lines fixed to governing trial: {selected_trial_for_slices}")
 
-            st.dataframe(
-                trials_df[["trial name", "centre", "R", "slices", "FoS", "status"]],
-                use_container_width=True, hide_index=True,
-            )
+            x_left = float(construction.get("x_left", min(float(toe[0]), float(crest[0]))))
+            x_right = float(construction.get("x_right", max(float(toe[0]), float(crest[0]))))
+            half_w = max(80.0, B_base / 2.0 + max(25.0, 4.5 * max(1.0, H_emb)))
+            x_lo = min(-half_w, x_left - 0.8 * max(1.0, H_emb))
+            x_hi = max(+half_w, x_right + 0.8 * max(1.0, H_emb))
+            x_plot = np.linspace(x_lo, x_hi, 400)
+            z_plot = np.array([z_surface_half(x, ground_z, z_finish, side_name, B_top_plot, B_base) for x in x_plot])
 
-            # ══════════════════════════════════════════════════════════════════
-            # B) All-trials overlay plot
-            # ══════════════════════════════════════════════════════════════════
-            st.subheader("All Trials — Overlay Plot")
+            st.subheader(f"All Trial Circles (A-I) — x = {x_stability:.0f} m")
+
+            # -----------------------------
+            # STAGE 0: GEOMETRY ONLY (RESET)
+            # -----------------------------
             fig_all, ax_all = plt.subplots(figsize=(12, 7))
+
             ax_all.set_xlabel("Horizontal y (m)")
             ax_all.set_ylabel("Level (mAOD)")
-            ax_all.set_title(f"All 6 Trials — x = {x_stability:.0f} m  (φ=0 method)")
-            ax_all.axhline(ground_z, color="brown", ls="-", lw=1.6, label="ground")
-            ax_all.plot(x_plot, z_plot, color="darkgreen", lw=2.2, label="embankment surface")
-            plot_lecture_construction(
-                ax_all,
-                x_crest=float(crest[0]), z_crest=float(crest[1]),
-                x_toe=float(toe[0]),     z_toe=float(toe[1]),
-            )
-            ax_all.plot(toe[0],   toe[1],   "bo", markersize=7, zorder=7)
-            ax_all.plot(crest[0], crest[1], "go", markersize=7, zorder=7)
-            ax_all.annotate("Toe",   xy=(toe[0],   toe[1]),   xytext=(6, -14), textcoords="offset points", fontsize=8)
-            ax_all.annotate("Crest", xy=(crest[0], crest[1]), xytext=(6,   8), textcoords="offset points", fontsize=8)
-            _z_lo = ground_z - 2.5 * max(1.0, H_emb)
-            _z_hi = z_finish + 2.0
-            for _, _tr in trials_df.iterrows():
-                _name = _tr["trial name"]
-                _colour = _col[_name]
-                _xc, _zc, _R = float(_tr["x_c"]), float(_tr["z_c"]), float(_tr["R"])
-                _is_crit = _name == _crit_name
-                _lw_arc  = 3.2 if _is_crit else 1.8
-                _alpha_c = 1.0 if _is_crit else 0.55
-                # full ghost circle
-                _theta = np.linspace(0.0, 2.0 * math.pi, 360)
-                ax_all.plot(_xc + _R * np.cos(_theta), _zc + _R * np.sin(_theta),
-                            color=_colour, lw=0.8, alpha=0.25, zorder=3)
-                # slip arc
-                _meta = trial_details.get(_name, (pd.DataFrame(), {}))[1]
-                if np.isfinite(float(_tr["FoS"])) and _meta.get("x_L") is not None:
-                    _xa = np.linspace(float(_meta["x_L"]), float(_meta["x_R"]), 240)
-                    _za = _zc - np.sqrt(np.maximum(0.0, _R**2 - (_xa - _xc)**2))
-                    _fos_lbl = f"{_name} FoS={float(_tr['FoS']):.3f}"
-                    ax_all.plot(_xa, _za, color=_colour, lw=_lw_arc, alpha=_alpha_c,
-                                label=_fos_lbl, zorder=4)
-                    _z_lo = min(_z_lo, float(_zc - _R - 1.5))
-                    _z_hi = max(_z_hi, float(_zc + _R + 1.5))
-                else:
-                    ax_all.plot([], [], color=_colour, lw=1.6,
-                                label=f"{_name} — invalid", zorder=4)
-                # centre marker
-                ax_all.plot(_xc, _zc, "o", color=_colour,
-                            markersize=10 if _is_crit else 7,
-                            markeredgecolor="black", markeredgewidth=0.8 if _is_crit else 0,
-                            zorder=6, alpha=_alpha_c)
-                # radius line
-                ax_all.plot([_xc, toe[0]], [_zc, toe[1]],
-                            color=_colour, lw=1.2, ls="--", alpha=0.5, zorder=5)
-                # FoS annotation near centre
-                if np.isfinite(float(_tr["FoS"])):
-                    ax_all.annotate(
-                        f"{float(_tr['FoS']):.2f}",
-                        xy=(_xc, _zc), xytext=(4, 4),
-                        textcoords="offset points",
-                        fontsize=7, color=_colour, fontweight="bold", zorder=7,
-                    )
-            ax_all.set_xlim(-half_w, half_w)
-            ax_all.set_ylim(_z_lo, _z_hi)
-            ax_all.grid(True, alpha=0.3)
-            ax_all.legend(loc="upper left", fontsize=8, framealpha=0.85)
-            ax_all.set_aspect("equal", adjustable="box")
-            plt.tight_layout()
-            st.pyplot(fig_all)
-            plt.close()
+            ax_all.set_title("Slope geometry only (reset before construction box / centres / circles)")
 
-            # ══════════════════════════════════════════════════════════════════
-            # C) All-chainages FoS summary table
-            # ══════════════════════════════════════════════════════════════════
-            if mc_df is not None and not mc_df.empty:
-                st.subheader("FoS at All Chainages")
-                _t_cols = [c for c in mc_df.columns if "Trial" in str(c)]
-                # colour-code: green ≥ required, red < required, grey = None
-                def _fos_colour(val):
-                    if val is None or (isinstance(val, float) and math.isnan(val)):
-                        return "color: #999999"
-                    try:
-                        v = float(val)
-                        if v >= min_FOS_required:
-                            return "color: #2c7e2c; font-weight: bold"
-                        return "color: #cc2222; font-weight: bold"
-                    except Exception:
-                        return ""
-                _mc_display = mc_df.copy()
-                _mc_display["chainage (m)"] = _mc_display["chainage (m)"].astype(int)
-                _style = _mc_display.style.applymap(_fos_colour, subset=_t_cols + ["min FoS"])
-                st.dataframe(_style, use_container_width=True, hide_index=True)
-                # Highlight the chainage used for detailed analysis
-                st.caption(
-                    f"Detailed analysis above uses x = {x_stability:.0f} m. "
-                    f"Green = FoS ≥ {min_FOS_required:.2f}, Red = below target."
+            # Ground level (horizontal)
+            ax_all.axhline(ground_z, color="brown", ls="-", lw=1.5, label="ground level")
+
+            # Slope surface profile (half section)
+            ax_all.plot(x_plot, z_plot, color="darkgreen", lw=2.2, label="slope profile")
+
+            # Toe + Crest points
+            ax_all.plot(float(toe[0]), float(toe[1]), "o", color="black", markersize=8, zorder=5)
+            ax_all.plot(float(crest[0]), float(crest[1]), "o", color="black", markersize=8, zorder=5)
+
+            ax_all.annotate("Toe", xy=(float(toe[0]), float(toe[1])), xytext=(6, -12),
+                            textcoords="offset points", fontsize=10, color="black")
+            ax_all.annotate("Crest", xy=(float(crest[0]), float(crest[1])), xytext=(-26, 6),
+                            textcoords="offset points", fontsize=10, color="black")
+
+            # -----------------------------
+            # STAGE 1+2: LECTURE CONSTRUCTION BOX + 9 INTERNAL CENTRES (via plot_lecture_construction)
+            # -----------------------------
+            x_toe = float(toe[0])
+            z_toe = float(toe[1])
+            x_crest = float(crest[0])
+            z_crest = float(crest[1])
+            H_slope = z_crest - z_toe
+
+            if H_slope > 0.0:
+                if not construction or "centres" not in construction:
+                    construction = _build_slope_stability_centres(toe, crest, H_slope)
+                plot_lecture_construction(
+                    ax_all,
+                    x_crest=x_crest,
+                    z_crest=z_crest,
+                    x_toe=x_toe,
+                    z_toe=z_toe,
+                    construction=construction,
                 )
 
-            # ══════════════════════════════════════════════════════════════════
-            # D) Selected-trial detail (slices, plot with hatching)
-            # ══════════════════════════════════════════════════════════════════
-            st.subheader("Single-Trial Detail")
-            default_name = critical_trial["trial name"] if critical_trial is not None else trial_names[0]
-            default_idx  = trial_names.index(default_name) if default_name in trial_names else 0
-            selected_trial = st.selectbox(
-                "Select trial for detailed slice plot",
-                trial_names, index=default_idx, key="phi0_trial_select",
-            )
-            selected_row = trials_df.loc[trials_df["trial name"] == selected_trial].iloc[0]
-            slices_df, trial_meta = trial_details.get(selected_trial, (pd.DataFrame(), {}))
-            x_c_sel = float(selected_row["x_c"])
-            z_c_sel = float(selected_row["z_c"])
-            R_sel   = float(selected_row["R"])
-            _sel_colour = _col.get(selected_trial, "red")
+            # Trials loop: full circles (faint), slip arcs (mask-based), slices (selected only)
+            for _, tr in trials_df.iterrows():
+                t_id = tr["trial_id"]
+                is_selected = (t_id == selected_trial_for_slices)
 
-            fig_slope, ax_slope = plt.subplots(figsize=(11, 6))
-            ax_slope.set_xlabel("Horizontal y (m)")
-            ax_slope.set_ylabel("Level (mAOD)")
-            ax_slope.set_title(f"{selected_trial} — x = {x_stability:.0f} m  "
-                               f"(FoS = {float(selected_row['FoS']):.3f})" if np.isfinite(float(selected_row["FoS"]))
-                               else f"{selected_trial} — invalid")
-            ax_slope.axhline(ground_z, color="brown", ls="-", lw=1.6, label="ground")
-            ax_slope.plot(x_plot, z_plot, color="darkgreen", lw=2.0, label="surface")
-            plot_lecture_construction(
-                ax_slope,
-                x_crest=float(crest[0]), z_crest=float(crest[1]),
-                x_toe=float(toe[0]),     z_toe=float(toe[1]),
-            )
-            _theta = np.linspace(0.0, 2.0 * math.pi, 360)
-            ax_slope.plot(x_c_sel + R_sel * np.cos(_theta),
-                          z_c_sel + R_sel * np.sin(_theta),
-                          color="gray", lw=1.0, alpha=0.35, label="full circle")
-            if np.isfinite(float(selected_row["FoS"])) and trial_meta.get("x_L") is not None:
-                x_arc = np.linspace(float(trial_meta["x_L"]), float(trial_meta["x_R"]), 240)
-                z_arc = z_c_sel - np.sqrt(np.maximum(0.0, R_sel**2 - (x_arc - x_c_sel)**2))
-                ax_slope.plot(x_arc, z_arc, color=_sel_colour, lw=3.0, label="slip arc")
-                x_edges = np.linspace(float(trial_meta["x_L"]), float(trial_meta["x_R"]),
-                                      int(selected_row["slices"]) + 1)
-                for xe in x_edges:
-                    z_se = z_surface_half(float(xe), ground_z, z_finish, side_name, B_top_plot, B_base)
-                    rad_e = R_sel**2 - (float(xe) - x_c_sel)**2
-                    if rad_e < 0:
-                        continue
-                    z_be = z_c_sel - math.sqrt(max(0.0, rad_e))
-                    ax_slope.plot([xe, xe], [z_be, z_se], color="black", lw=0.8, alpha=0.45)
-            ax_slope.plot(x_c_sel, z_c_sel, "o", color=_sel_colour,
-                          markersize=10, markeredgecolor="black", markeredgewidth=1.0,
-                          label="centre", zorder=6)
-            ax_slope.plot([x_c_sel, toe[0]], [z_c_sel, toe[1]],
-                          color=_sel_colour, lw=1.8, ls="-", zorder=5, label="radius (centre→toe)")
-            ax_slope.plot(toe[0],   toe[1],   "bo", markersize=6, zorder=6)
-            ax_slope.plot(crest[0], crest[1], "go", markersize=6, zorder=6)
-            ax_slope.annotate("Toe",   xy=(toe[0],   toe[1]),   xytext=(6, -12), textcoords="offset points")
-            ax_slope.annotate("Crest", xy=(crest[0], crest[1]), xytext=(6,   8), textcoords="offset points")
-            ax_slope.set_xlim(-half_w, half_w)
-            _y_lo = min(ground_z - 2.5 * max(1.0, H_emb), z_c_sel - R_sel - 2.0)
-            _y_hi = max(z_finish + 4.0, z_c_sel + R_sel + 2.0)
-            ax_slope.set_ylim(_y_lo, _y_hi)
-            ax_slope.grid(True, alpha=0.3)
-            ax_slope.legend(loc="upper left", fontsize=8, framealpha=0.85)
-            ax_slope.set_aspect("equal", adjustable="box")
-            plt.tight_layout()
-            st.pyplot(fig_slope)
-            plt.close()
-
-            with st.expander("Slice table (lecture check)", expanded=False):
-                st.dataframe(slices_df, use_container_width=True, hide_index=True)
-                _sTi = trial_meta.get("sum_Ti", float("nan"))
-                _sDi = trial_meta.get("sum_Di", float("nan"))
-                if np.isfinite(float(selected_row["FoS"])):
-                    st.caption(
-                        f"Sum Ti = Cu x b x sec(a) = {_sTi:.3f}  |  "
-                        f"Sum Di = W x sin(a) = {_sDi:.3f}  "
-                        f"(signed: passive slices subtract)  |  "
-                        f"FoS = {_sTi:.3f} / {_sDi:.3f} = {float(selected_row['FoS']):.4f}"
-                    )
+                if is_selected:
+                    full_alpha = 0.18
+                    full_lw = 1.2
+                    arc_alpha = 0.85
+                    arc_lw = 2.4
                 else:
-                    st.caption("Trial invalid — check geometry or centre position.")
+                    full_alpha = 0.05        # very faint full circles
+                    full_lw = 1.0
+                    arc_alpha = 0.0         # hide non-selected slip arcs
+                    arc_lw = 0.0
 
-            st.caption("**Values carried forward →** Critical FoS and trial table.")
+                xc = float(tr["centre_x"])
+                zc = float(tr["centre_y"])
+                R = float(tr["radius"])
+                fos = float(tr["FoS"]) if np.isfinite(float(tr["FoS"])) else float("nan")
+                fail = (not np.isfinite(fos)) or (fos < 1.0)
+                colour = "#d62728" if fail else "#3b6ea8"
+
+                # Radius line style (centre -> toe)
+                if is_selected:
+                    rline_colour = colour
+                    rline_alpha = 0.35
+                    rline_lw = 1.2
+                    rline_ls = "--"
+                    rline_z = 3
+                else:
+                    rline_colour = "#9aa4b2"   # neutral guide
+                    rline_alpha = 0.08
+                    rline_lw = 1.0
+                    rline_ls = "--"
+                    rline_z = 1
+
+                # Full circle
+                theta = np.linspace(0.0, 2.0 * np.pi, 600)
+                ax_all.plot(
+                    xc + R * np.cos(theta),
+                    zc + R * np.sin(theta),
+                    color=colour,
+                    lw=full_lw,
+                    alpha=full_alpha,
+                    zorder=1,
+                    label=None,
+                )
+
+                # Radius line (centre -> toe)
+                ax_all.plot(
+                    [xc, float(toe[0])],
+                    [zc, float(toe[1])],
+                    color=rline_colour,
+                    lw=rline_lw,
+                    ls=rline_ls,
+                    alpha=rline_alpha,
+                    zorder=rline_z,
+                )
+
+                # Mask-based slip arc (portion below ground/slope surface)
+                xs = np.linspace(x_lo, x_hi, 1400)
+                zs = np.array([z_surface_half(float(x), ground_z, z_finish, side_name, B_top_plot, B_base) for x in xs], dtype=float)
+                rad = R * R - (xs - xc) ** 2
+                zs_circle = np.full_like(xs, np.nan, dtype=float)
+                ok = rad >= 0.0
+                zs_circle[ok] = zc - np.sqrt(rad[ok])
+                mask = np.isfinite(zs_circle) & (zs_circle <= zs)
+
+                idx = np.where(mask)[0]
+                if idx.size > 0:
+                    runs = []
+                    start = idx[0]
+                    for i in range(1, len(idx)):
+                        if idx[i] - idx[i - 1] > 1:
+                            runs.append((start, idx[i - 1]))
+                            start = idx[i]
+                    runs.append((start, idx[-1]))
+                    for start_i, end_i in runs:
+                        ax_all.plot(xs[start_i : end_i + 1], zs_circle[start_i : end_i + 1], color=colour, lw=arc_lw, alpha=arc_alpha, zorder=4)
+
+                # Slices: only for selected trial, only where mask is True
+                if t_id == selected_trial_for_slices:
+                    idx_s = np.where(mask)[0]
+                    if idx_s.size > 0:
+                        x_min = float(xs[idx_s[0]])
+                        x_max = float(xs[idx_s[-1]])
+                        x_edges = np.linspace(x_min, x_max, int(n_slices) + 1)
+                        for xe in x_edges:
+                            z_top = z_surface_half(float(xe), ground_z, z_finish, side_name, B_top_plot, B_base)
+                            rad_e = R * R - (xe - xc) ** 2
+                            if rad_e < 0:
+                                continue
+                            z_bot = zc - math.sqrt(max(0.0, rad_e))
+                            if z_bot > z_top:
+                                continue
+                            ax_all.plot([xe, xe], [z_bot, z_top], color="black", lw=0.7, alpha=0.35, zorder=3)
+
+            # Axis framing (tight but readable)
+            H_emb = max(1.0, float(H_emb))
+            ax_all.set_xlim(x_lo, x_hi)
+            ax_all.set_ylim(ground_z - 2.5 * H_emb, z_finish + 2.0 * H_emb)
+
+            ax_all.grid(True, alpha=0.3)
+            ax_all.legend(loc="upper left", fontsize=8.5, framealpha=0.9, ncol=3, title="Plot key")
+            ax_all.set_aspect("equal", adjustable="box")
+            plt.tight_layout()
+
+            st.pyplot(fig_all)
+            plt.close(fig_all)
+
+            if H_slope > 0.0 and construction and construction.get("centres"):
+                with st.expander("DEBUG — construction centres coordinates", expanded=False):
+                    cdf = pd.DataFrame(construction["centres"])
+                    st.dataframe(cdf, use_container_width=True, hide_index=True)
+                    st.caption(f"x_left={construction['x_left']:.3f}, x_right={construction['x_right']:.3f}")
+                    st.caption(f"z_bottom={construction['z_bottom']:.3f}, z_top={construction['z_top']:.3f}")
+
+            with st.expander("FoS formulas used", expanded=False):
+                st.latex(r"FoS = \frac{\sum (c_u b \sec\alpha)}{\sum (W \sin\alpha)}")
+                st.latex(r"c_u = 69.5\ \text{kPa (shear vane, slope section only)}")
+                st.latex(r"W = \gamma_{fill}A_{fill} + \gamma_{clay}A_{clay}")
+
+            display_cols = ["trial_id", "centre_x", "centre_y", "radius", "FoS", "PASS/FAIL", "status"]
+            table_df = trials_df[display_cols].copy()
+            st.subheader("Trial Results Table")
+            st.dataframe(table_df, use_container_width=True, hide_index=True)
+
+            with st.expander("Arc endpoint debug (toe/crest/intersections)", expanded=False):
+                toe_tol_dbg = 1e-3
+                for _, _tr_dbg in trials_df.iterrows():
+                    _tid = str(_tr_dbg["trial_id"])
+                    _, _m_dbg = trial_details.get(_tid, (pd.DataFrame(), {}))
+                    def _safe_float(v):
+                        return float(v) if v is not None else float("nan")
+                    _x_toe_dbg = _safe_float(_m_dbg.get("x_toe"))
+                    _x_crest_dbg = _safe_float(_m_dbg.get("x_crest"))
+                    _xL_dbg = _safe_float(_m_dbg.get("x_L"))
+                    _xR_dbg = _safe_float(_m_dbg.get("x_R"))
+                    _xR_toe_dbg = abs(_xR_dbg - _x_toe_dbg) <= toe_tol_dbg
+                    st.caption(
+                        f"Trial {_tid}: x_toe={_x_toe_dbg:.4f}, x_crest={_x_crest_dbg:.4f}, "
+                        f"x_L={_xL_dbg:.4f}, x_R={_xR_dbg:.4f}, x_R≈x_toe={_xR_toe_dbg}"
+                    )
+
+            selected_slices_df, selected_meta = trial_details.get(selected_trial_for_slices, (pd.DataFrame(), {}))
+
+            with st.expander(f"Slice table for trial {selected_trial_for_slices}", expanded=False):
+                st.dataframe(selected_slices_df, use_container_width=True, hide_index=True)
+                if selected_slices_df is not None and not selected_slices_df.empty:
+                    sum_resisting = float(pd.to_numeric(selected_slices_df["Ti_cubseca"], errors="coerce").sum())
+                    sum_driving = float(pd.to_numeric(selected_slices_df["Di_Wsina"], errors="coerce").sum())
+                    st.caption(
+                        f"Sum resisting = {sum_resisting:.3f} | "
+                        f"Sum driving = {sum_driving:.3f}"
+                    )
+
+            with st.expander("Lecture Method — Slice Breakdown (Selected Trial)", expanded=False):
+                if selected_slices_df is None or selected_slices_df.empty:
+                    st.info("No slice data available for selected trial.")
+                else:
+                    slice_lecture_df = selected_slices_df
+                    st.dataframe(slice_lecture_df, use_container_width=True, hide_index=True)
+
+                    b_m = pd.to_numeric(slice_lecture_df["b_m"], errors="coerce")
+                    sec_alpha = pd.to_numeric(slice_lecture_df["sec_alpha"], errors="coerce")
+                    W_kN = pd.to_numeric(slice_lecture_df["W_kN"], errors="coerce")
+                    alpha_rad = pd.to_numeric(slice_lecture_df["alpha_rad"], errors="coerce")
+                    cu_kPa = pd.to_numeric(slice_lecture_df["cu_kPa"], errors="coerce")
+                    Ti_stored = pd.to_numeric(slice_lecture_df["Ti_cubseca"], errors="coerce")
+                    Di_stored = pd.to_numeric(slice_lecture_df["Di_Wsina"], errors="coerce")
+
+                    Ti_check = cu_kPa * b_m * sec_alpha
+                    Di_check = W_kN * np.sin(alpha_rad)
+
+                    ti_err = np.abs(Ti_check - Ti_stored)
+                    di_err = np.abs(Di_check - Di_stored)
+                    max_abs_err_Ti = float(np.nanmax(ti_err.values)) if len(ti_err) > 0 else float("nan")
+                    max_abs_err_Di = float(np.nanmax(di_err.values)) if len(di_err) > 0 else float("nan")
+
+                    sum_resisting = float(Ti_stored.sum())
+                    sum_driving = float(Di_stored.sum())
+                    FoS_check = sum_resisting / sum_driving if sum_driving > 0 else np.nan
+
+                    if (np.isfinite(max_abs_err_Ti) and max_abs_err_Ti < 1e-6) and (np.isfinite(max_abs_err_Di) and max_abs_err_Di < 1e-6):
+                        st.caption(
+                            f"Self-check OK: max_abs_err_Ti={max_abs_err_Ti:.3e}, "
+                            f"max_abs_err_Di={max_abs_err_Di:.3e}"
+                        )
+                    else:
+                        st.error(
+                            f"Self-check FAILED: max_abs_err_Ti={max_abs_err_Ti:.3e}, "
+                            f"max_abs_err_Di={max_abs_err_Di:.3e}"
+                        )
+
+                    st.markdown("### Totals")
+                    st.write(f"Σ(cu b secα) = {sum_resisting:.3f} kN/m")
+                    st.write(f"Σ(W sinα) = {sum_driving:.3f} kN/m")
+                    st.write(f"FoS = {FoS_check:.3f}")
+                    st.caption(f"FoS recomputed from sums = {FoS_check:.4f} (must match plotted FoS)")
 
     # -------------------------------------------------------------------------
     # 6) Summary (Values carried forward)
@@ -3527,11 +3957,15 @@ if df1 is not None:
         V_fill = float(((A_vol[:-1] + A_vol[1:]) * 0.5 * (x_vol[1:] - x_vol[:-1])).sum())
     sum_rows.append({"Metric": "Fill volume (m³)", "Value": f"{V_fill:,.0f}"})
     if run_slope_stability and slope_stab_result is not None:
-        critical_trial = slope_stab_result.get("critical_trial") if isinstance(slope_stab_result, dict) else None
-        min_FOS_val = float(critical_trial["FoS"]) if critical_trial is not None else None
+        trials_df_summary = slope_stab_result.get("trials_df") if isinstance(slope_stab_result, dict) else None
+        min_FOS_val = None
+        if trials_df_summary is not None and len(trials_df_summary) > 0:
+            valid_fos = pd.to_numeric(trials_df_summary["FoS"], errors="coerce")
+            if valid_fos.notna().any():
+                min_FOS_val = float(valid_fos.min())
         if min_FOS_val is not None and np.isfinite(min_FOS_val):
             sum_rows.append({"Metric": "Min FOS", "Value": f"{min_FOS_val:.3f}"})
-            cu_req = cu * min_FOS_required / min_FOS_val
+            cu_req = float(SLOPE_STABILITY_CU_KPA) * min_FOS_required / min_FOS_val
             sum_rows.append({"Metric": "Required c_u for target FOS (kPa)", "Value": f"{cu_req:.1f}"})
     summary_table_df = pd.DataFrame(sum_rows)
     st.dataframe(summary_table_df, use_container_width=True, hide_index=True)
@@ -3572,15 +4006,17 @@ if df1 is not None:
                 _zc = float(geom_debug.get("crest", (0, 0))[1])
                 _H  = float(geom_debug.get("H", 0.0))
                 _x_mid = 0.5 * (_xc + _xt)
+                _construction = geom_debug.get("construction", {})
+                _centres = _construction.get("centres", [])
                 st.markdown("**Slope geometry (centre debug)**")
                 st.code(
                     f"x_crest={_xc:.3f}  x_mid={_x_mid:.3f}  x_toe={_xt:.3f}\n"
                     f"z_crest={_zc:.3f}  z_toe={_zt:.3f}  H={_H:.3f}\n"
-                    f"Guide x: [{_xc:.3f}, {_x_mid:.3f}, {_xt:.3f}]\n"
-                    f"Guide z: [{_zc:.3f}, {_zc+0.75*_H:.3f}, {_zc+Z3_FACTOR*_H:.3f}]\n"
+                    f"Box x: [{float(_construction.get('x_left', _xc)):.3f}, {float(_construction.get('x_right', _xt)):.3f}]\n"
+                    f"Box z: [{float(_construction.get('z_bottom', _zc)):.3f}, {float(_construction.get('z_top', _zc + 0.75 * _H)):.3f}]\n"
                     + "\n".join(
-                        f"{row['trial name']}: ({row['x_c']:.3f}, {row['z_c']:.3f})  R={row['R']:.3f}"
-                        for _, row in trials_df_debug.iterrows()
+                        f"{c.get('trial_id', '?')}: ({float(c.get('x', 0.0)):.3f}, {float(c.get('z', 0.0)):.3f})"
+                        for c in _centres
                     )
                 )
         val_df = pd.DataFrame(settlement_summary)
@@ -3590,6 +4026,7 @@ if df1 is not None:
             warn_df = pd.DataFrame(monotonic_warnings)
             st.warning("Non-monotonic settlement vs load detected (H_fill ↑ but ρ_c ↓). See table below.")
             st.dataframe(warn_df, use_container_width=True, hide_index=True)
+    st = _st_module
 
 else:
     st.info("Click **Run calculations** in the sidebar to run.")

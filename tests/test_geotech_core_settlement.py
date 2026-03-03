@@ -3,11 +3,14 @@ import numpy as np
 
 from geotech_core_settlement import (
     StressInputs,
-    sigma_v0_prime_kpa,
-    settlement_primary_1d,
-    Uv_from_Tv,
     Tv_from_Uv,
+    Uv_from_Tv,
+    consolidation_times_table,
+    consolidation_times_table_sand_drain,
     consolidation_time_years,
+    sand_drain_design_fixed_point,
+    settlement_primary_1d,
+    sigma_v0_prime_kpa,
 )
 
 
@@ -111,3 +114,37 @@ def test_consolidation_time_increases_with_U():
     _Tv50, t50 = consolidation_time_years(Cv, Hd, 0.50)
     _Tv90, t90 = consolidation_time_years(Cv, Hd, 0.90)
     assert t20 < t50 < t90
+
+
+def test_pvd_design_matches_notebook_target_spacing():
+    design = sand_drain_design_fixed_point(
+        Ur_target=0.88764,
+        Ch_m2_per_s=1e-7,
+        t_design_years=2.0,
+        rd_m=0.15,
+    )
+    assert abs(float(design["n_final"]) - 12.69) < 0.05
+    assert abs(float(design["S_m"]) - 3.374) < 0.02
+
+
+def test_pvd_combined_t90_is_lower_than_vertical_only():
+    H0 = 8.0
+    Cv = 1e-7
+    drainage = "double"
+    design = sand_drain_design_fixed_point(
+        Ur_target=0.88764,
+        Ch_m2_per_s=1e-7,
+        t_design_years=2.0,
+        rd_m=0.15,
+    )
+    vertical = consolidation_times_table(Cv_m2_per_s=Cv, H0_m=H0, drainage=drainage, U_targets=(0.2, 0.5, 0.9))
+    combined = consolidation_times_table_sand_drain(
+        Cv_m2_per_s=Cv,
+        H0_m=H0,
+        drainage=drainage,
+        Ch_m2_per_s=1e-7,
+        spacing_s_m=float(design["S_m"]),
+        rd_m=float(design["rd_m"]),
+        U_targets=(0.9,),
+    )
+    assert float(combined.iloc[0]["U90_t_years"]) < float(vertical.iloc[0]["U90_t_years"])

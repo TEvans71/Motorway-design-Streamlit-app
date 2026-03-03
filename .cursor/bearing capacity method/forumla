@@ -1,0 +1,13 @@
+Method:
+1) Length long = chainage length e.g. x=500 
+    Do for all chainage 
+2) Hight of embankment= ?(m)
+3) Applied pressure at bottom of embankment p (KPa) = hight of embankment (m) * 20 
+4) Applied stress Ed (Kpa) = Applied pressure at bottom of embankment p (KPa) * 1.35
+5) Undrained shear strength Cu (Kpa) = varies with depth , 7,15,25 
+6) Bearing Capacity factor, Nc = 5.14
+7) Cu Design strength =   Undrained shear strength Cu (Kpa) / 1.4
+8) Bearing capacity qf (KPa) = Bearing Capacity factor Nc * Cu design strength + Applied presure at bottom of embankment p (KPa)
+9) Safe bearing capacity, qs (KPa) = Bearing capacity * Cu design strength
+10) Utilisation = Applied stress Ed / Safe bearing Capacity 
+11) Cu Required = Applied stress Ed / Bearing Capacity Factor
