@@ -1481,30 +1481,35 @@ def _resolve_trial_centre(spec: TrialSpec, toe: tuple, crest: tuple, H: float, s
     Resolve trial centre from descriptor mode or manual override.
     Manual x_c/z_c always take precedence.
 
-    Convention for "kH on Toe":
-      The construction moves FROM the toe TOWARDS the crest (i.e. inward).
-      dir_to_toe = +1 if toe is to the right of crest (right-hand slope),
-                 = -1 if toe is to the left of crest (left-hand slope).
-      x_base = x_toe - dir_to_toe * k * H   (always moves towards crest)
+    Lecture construction (Barnes/Craig 9-point grid):
+      3 vertical guides:   x_left = x_crest
+                           x_mid  = 0.5*(x_crest + x_toe)
+                           x_right= x_toe
+      3 horizontal guides: z0   = z_crest  (0H above crest)
+                           z075 = z_crest + 0.75*H
+                           z3   = z_crest + Z3_FACTOR*H  (see Z3_FACTOR constant)
+
+      slope_position → x:   "left"   → x_left (at crest)
+                            "middle" → x_mid
+                            "right"  → x_right (at toe)
+      crest_height_mode → z: "0H"   → z0
+                             "3/4H" → z075
+    Each trial centre is the exact intersection point (one of the 9 grid points).
     """
     if spec.x_c is not None and spec.z_c is not None:
         return float(spec.x_c), float(spec.z_c), "manual"
     x_toe, _ = toe
     x_crest, z_crest = crest
-    # +1 when toe is to the right of crest (right-hand slope), -1 otherwise
-    dir_to_toe = 1.0 if x_toe > x_crest else -1.0
-    toe_offset_h = _parse_toe_offset_factor(spec.toe_offset_mode)
-    # Move inward from toe (towards crest) by k*H
-    x_base = x_toe - dir_to_toe * toe_offset_h * H
-    slope_span = abs(x_toe - x_crest)
-    lateral_shift = 0.0
+    # x: map slope_position to one of the 3 vertical guide x-coordinates
     slope_pos = str(spec.slope_position).strip().lower()
     if slope_pos == "left":
-        lateral_shift = -0.5 * dir_to_toe * slope_span
+        x_c = float(x_crest)
     elif slope_pos == "right":
-        lateral_shift = +0.5 * dir_to_toe * slope_span
-    x_c = x_base + lateral_shift
-    z_c = z_crest + _parse_crest_height_factor(spec.crest_height_mode) * H
+        x_c = float(x_toe)
+    else:  # middle
+        x_c = 0.5 * (float(x_crest) + float(x_toe))
+    # z: crest level + height factor * H
+    z_c = float(z_crest) + _parse_crest_height_factor(spec.crest_height_mode) * float(H)
     return float(x_c), float(z_c), "descriptor"
 
 
@@ -1692,7 +1697,6 @@ def run_phi0_trials(df1: pd.DataFrame, x_stability: float, B_top: float, side: s
     toe = (float(x_toe), float(ground_z))
     crest = (float(x_crest), float(z_finish))
     surface_fn = lambda x: z_surface_half(float(x), ground_z, z_finish, side_name, B_top, B_base)
-    dir_to_toe = 1.0 if float(x_toe) > float(x_crest) else -1.0
     trial_rows = []
     trial_details = {}
     for spec in trial_specs:
@@ -1700,11 +1704,12 @@ def run_phi0_trials(df1: pd.DataFrame, x_stability: float, B_top: float, side: s
         R = float(math.hypot(x_c - toe[0], z_c - toe[1]))
         print(
             f"[phi0 debug] {spec.name}: "
+            f"grid=({spec.slope_position}/{spec.crest_height_mode})  "
             f"x_crest={x_crest:.3f}  z_crest={z_finish:.3f}  "
             f"x_toe={x_toe:.3f}  z_toe={ground_z:.3f}  "
-            f"H={H:.3f}  dir_to_toe={dir_to_toe:+.0f}  "
+            f"H={H:.3f}  "
             f"x_c={x_c:.3f}  z_c={z_c:.3f}  "
-            f"x_c<x_toe={x_c < x_toe if dir_to_toe > 0 else x_c > x_toe}"
+            f"R={math.hypot(x_c - x_toe, z_c - ground_z):.3f}"
         )
         slices_df = pd.DataFrame(columns=["slice", "b", "z_surf", "z_base", "h", "A_fill", "A_clay", "W", "alpha_deg", "sec", "sinabs", "Ti", "Di"])
         meta = {"valid": False, "reason": None, "R": R}
@@ -3406,16 +3411,15 @@ if df1 is not None:
                 _zt = float(geom_debug.get("toe", (0, 0))[1])
                 _zc = float(geom_debug.get("crest", (0, 0))[1])
                 _H  = float(geom_debug.get("H", 0.0))
-                _dir = 1.0 if _xt > _xc else -1.0
+                _x_mid = 0.5 * (_xc + _xt)
                 st.markdown("**Slope geometry (centre debug)**")
                 st.code(
-                    f"x_crest = {_xc:.3f}   z_crest = {_zc:.3f}\n"
-                    f"x_toe   = {_xt:.3f}   z_toe   = {_zt:.3f}\n"
-                    f"H       = {_H:.3f}\n"
-                    f"dir_to_toe = {_dir:+.0f}  (right-hand slope: +1)\n"
+                    f"x_crest={_xc:.3f}  x_mid={_x_mid:.3f}  x_toe={_xt:.3f}\n"
+                    f"z_crest={_zc:.3f}  z_toe={_zt:.3f}  H={_H:.3f}\n"
+                    f"Guide x: [{_xc:.3f}, {_x_mid:.3f}, {_xt:.3f}]\n"
+                    f"Guide z: [{_zc:.3f}, {_zc+0.75*_H:.3f}, {_zc+Z3_FACTOR*_H:.3f}]\n"
                     + "\n".join(
-                        f"{row['trial name']}: x_c={row['x_c']:.3f}  z_c={row['z_c']:.3f}  "
-                        f"x_c<x_toe={row['x_c'] < _xt if _dir > 0 else row['x_c'] > _xt}"
+                        f"{row['trial name']}: ({row['x_c']:.3f}, {row['z_c']:.3f})  R={row['R']:.3f}"
                         for _, row in trials_df_debug.iterrows()
                     )
                 )
