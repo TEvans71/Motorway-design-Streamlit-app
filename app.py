@@ -1607,11 +1607,13 @@ def phi0_slices_fos(surface_z: Callable[[float], float], ground_z: float,
         "R": R,
         "sum_Ti": 0.0,
         "sum_Di": 0.0,
+        "area_split_verified": False,
     }
     columns = [
         "slice_no", "x_mid", "b_m", "z_top", "z_bottom", "area_m2",
+        "A_fill_m2", "A_clay_m2",
         "gamma_fill_kN_per_m3", "gamma_clay_kN_per_m3",
-        "W_fill_kN", "W_clay_kN", "W_kN", "gamma_avg_kN_per_m3 (derived)",
+        "W_fill_kN", "W_clay_kN", "W_kN", "gamma_equiv_kN_per_m3 (derived)",
         "alpha_rad", "alpha_deg", "sec_alpha", "W_sin_alpha", "cu_kPa", "Ti_cubseca", "Di_Wsina",
     ]
     if R <= 0.0 or int(n_slices) <= 0:
@@ -1687,13 +1689,14 @@ def phi0_slices_fos(surface_z: Callable[[float], float], ground_z: float,
         if radicand < 0.0:
             z_bottom = float("nan")
             h = 0.0
+            A_total = 0.0
             A_fill = 0.0
             A_clay = 0.0
-            area_m2 = 0.0
+            area_m2 = A_total
             W_fill = 0.0
             W_clay = 0.0
             W = 0.0
-            gamma_avg = float("nan")
+            gamma_equiv = float("nan")
             alpha = 0.0
             sec_a = 1.0
             sin_a = 0.0
@@ -1702,13 +1705,16 @@ def phi0_slices_fos(surface_z: Callable[[float], float], ground_z: float,
         else:
             z_bottom = z_c - math.sqrt(max(0.0, radicand))  # lower arc
             h = max(0.0, z_top - z_bottom)
+            A_total = h * b
             A_fill = max(0.0, z_top - max(z_bottom, ground_z)) * b
             A_clay = max(0.0, min(z_top, ground_z) - z_bottom) * b
-            area_m2 = A_fill + A_clay
+            area_m2 = A_total
+            if abs((A_fill + A_clay) - A_total) > 1e-6:
+                raise ValueError("Area split mismatch in slice calculation")
             W_fill = gamma_fill * A_fill
             W_clay = gamma_clay * A_clay
             W = W_fill + W_clay
-            gamma_avg = W / max(1e-12, area_m2)
+            gamma_equiv = W / max(1e-12, area_m2)
             denom = z_bottom - z_c
             if abs(denom) < 1e-12:
                 alpha = 0.0
@@ -1728,12 +1734,14 @@ def phi0_slices_fos(surface_z: Callable[[float], float], ground_z: float,
             "z_top": z_top,
             "z_bottom": z_bottom,
             "area_m2": area_m2,
+            "A_fill_m2": A_fill,
+            "A_clay_m2": A_clay,
             "gamma_fill_kN_per_m3": float(gamma_fill),
             "gamma_clay_kN_per_m3": float(gamma_clay),
             "W_fill_kN": W_fill,
             "W_clay_kN": W_clay,
             "W_kN": W,
-            "gamma_avg_kN_per_m3 (derived)": gamma_avg,
+            "gamma_equiv_kN_per_m3 (derived)": gamma_equiv,
             "alpha_rad": alpha,
             "alpha_deg": math.degrees(alpha),
             "sec_alpha": sec_a,
@@ -1756,6 +1764,7 @@ def phi0_slices_fos(surface_z: Callable[[float], float], ground_z: float,
         "sum_Ti": sum_Ti,
         "sum_Di": sum_Di,
         "cu_kPa": cu_kPa,
+        "area_split_verified": True,
     })
     return fos, slices_df, meta
 
@@ -3756,6 +3765,7 @@ if df1 is not None:
     else:
         idx_stab = (df1["x"] - float(x_stability)).abs().idxmin()
         row_stab = df1.loc[idx_stab]
+        ground_key = "ground level" if "ground level" in row_stab.index else "ground"
         sig = (
             float(x_stability),
             float(B_top),
@@ -3764,7 +3774,7 @@ if df1 is not None:
             float(gamma_clay),
             int(n_slices),
             float(SLOPE_STABILITY_CU_KPA),
-            float(row_stab["ground"]),
+            float(row_stab[ground_key]),
             float(row_stab["Z_finish"]),
             float(row_stab["B_base"]),
         )
