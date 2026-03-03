@@ -1480,21 +1480,29 @@ def _resolve_trial_centre(spec: TrialSpec, toe: tuple, crest: tuple, H: float, s
     """
     Resolve trial centre from descriptor mode or manual override.
     Manual x_c/z_c always take precedence.
+
+    Convention for "kH on Toe":
+      The construction moves FROM the toe TOWARDS the crest (i.e. inward).
+      dir_to_toe = +1 if toe is to the right of crest (right-hand slope),
+                 = -1 if toe is to the left of crest (left-hand slope).
+      x_base = x_toe - dir_to_toe * k * H   (always moves towards crest)
     """
     if spec.x_c is not None and spec.z_c is not None:
         return float(spec.x_c), float(spec.z_c), "manual"
     x_toe, _ = toe
     x_crest, z_crest = crest
-    side_sign = 1.0 if str(side).lower() == "right" else -1.0
+    # +1 when toe is to the right of crest (right-hand slope), -1 otherwise
+    dir_to_toe = 1.0 if x_toe > x_crest else -1.0
     toe_offset_h = _parse_toe_offset_factor(spec.toe_offset_mode)
-    x_base = x_toe + side_sign * toe_offset_h * H
+    # Move inward from toe (towards crest) by k*H
+    x_base = x_toe - dir_to_toe * toe_offset_h * H
     slope_span = abs(x_toe - x_crest)
     lateral_shift = 0.0
     slope_pos = str(spec.slope_position).strip().lower()
     if slope_pos == "left":
-        lateral_shift = -0.5 * side_sign * slope_span
+        lateral_shift = -0.5 * dir_to_toe * slope_span
     elif slope_pos == "right":
-        lateral_shift = +0.5 * side_sign * slope_span
+        lateral_shift = +0.5 * dir_to_toe * slope_span
     x_c = x_base + lateral_shift
     z_c = z_crest + _parse_crest_height_factor(spec.crest_height_mode) * H
     return float(x_c), float(z_c), "descriptor"
@@ -1570,6 +1578,20 @@ def phi0_slices_fos(surface_z: Callable[[float], float], ground_z: float,
         meta["x_L"], meta["x_R"] = x_L, x_R
         return (float("nan"), pd.DataFrame(columns=columns), meta)
     x_edges = np.linspace(x_L, x_R, int(n_slices) + 1)
+
+    # Safety check: if every surface z equals ground_z but the embankment
+    # has appreciable height, the caller probably passed the wrong surface function.
+    _x_mids_check = np.linspace(x_L, x_R, min(10, int(n_slices) + 1))
+    _z_surf_check = np.array([float(surface_z(x)) for x in _x_mids_check])
+    _z_crest_approx = float(surface_z(0.5 * (x_L + x_R)))
+    if (np.allclose(_z_surf_check, ground_z, atol=1e-6)
+            and abs(_z_crest_approx - ground_z) < 1e-6
+            and abs(x_R - x_L) > 0.5):
+        # All surface samples equal ground_z — surface_z is returning ground level,
+        # not the embankment surface.  Flag this trial as invalid.
+        meta["reason"] = "z_surf_using_ground_not_surface"
+        return (float("nan"), pd.DataFrame(columns=columns), meta)
+
     rows = []
     sum_Ti = 0.0
     sum_Di = 0.0
@@ -1670,11 +1692,20 @@ def run_phi0_trials(df1: pd.DataFrame, x_stability: float, B_top: float, side: s
     toe = (float(x_toe), float(ground_z))
     crest = (float(x_crest), float(z_finish))
     surface_fn = lambda x: z_surface_half(float(x), ground_z, z_finish, side_name, B_top, B_base)
+    dir_to_toe = 1.0 if float(x_toe) > float(x_crest) else -1.0
     trial_rows = []
     trial_details = {}
     for spec in trial_specs:
         x_c, z_c, centre_mode = _resolve_trial_centre(spec, toe, crest, H, side_name)
         R = float(math.hypot(x_c - toe[0], z_c - toe[1]))
+        print(
+            f"[phi0 debug] {spec.name}: "
+            f"x_crest={x_crest:.3f}  z_crest={z_finish:.3f}  "
+            f"x_toe={x_toe:.3f}  z_toe={ground_z:.3f}  "
+            f"H={H:.3f}  dir_to_toe={dir_to_toe:+.0f}  "
+            f"x_c={x_c:.3f}  z_c={z_c:.3f}  "
+            f"x_c<x_toe={x_c < x_toe if dir_to_toe > 0 else x_c > x_toe}"
+        )
         slices_df = pd.DataFrame(columns=["slice", "b", "z_surf", "z_base", "h", "A_fill", "A_clay", "W", "alpha_deg", "sec", "sinabs", "Ti", "Di"])
         meta = {"valid": False, "reason": None, "R": R}
         fos = float("nan")
@@ -1722,6 +1753,87 @@ def run_phi0_trials(df1: pd.DataFrame, x_stability: float, B_top: float, side: s
         "x_stability": float(x_stability),
     }
     return trials_df, critical_trial, trial_details, geometry
+
+
+# ---------------------------------------------------------------------------
+# Lecture construction overlay — right-triangle + 9 guide-point grid
+# ---------------------------------------------------------------------------
+# Z3_FACTOR: the third horizontal guide level above crest expressed as
+# multiples of H.  Change only this constant if the lecture uses a different
+# third level (default = 1.50 H above crest).
+Z3_FACTOR = 1.50
+
+
+def plot_lecture_construction(ax, x_crest: float, z_crest: float,
+                               x_toe: float, z_toe: float) -> None:
+    """
+    Overlay the lecture construction geometry onto *ax*:
+      A) 90° right triangle  (T → T_up → C)
+      B) 3 vertical   dashed-blue guide lines
+      C) 3 horizontal dashed-blue guide lines
+      D) 9 labelled intersection points  P1 … P9
+    Call this BEFORE drawing the selected-trial centre/radius so the
+    triangle sits underneath the circle.
+    """
+    H = z_crest - z_toe
+    if H <= 0.0:
+        return
+
+    # ── A) 90° triangle ──────────────────────────────────────────────────
+    T    = (x_toe,   z_toe)
+    C    = (x_crest, z_crest)
+    T_up = (x_toe,   z_crest)
+
+    tri_kw = dict(color="steelblue", lw=1.2, ls="--", alpha=0.70, zorder=2)
+    ax.plot([T[0],    T_up[0]], [T[1],    T_up[1]], **tri_kw, label="_tri_v")
+    ax.plot([T_up[0], C[0]],   [T_up[1], C[1]],   **tri_kw, label="_tri_h")
+    ax.plot([C[0],    T[0]],   [C[1],    T[1]],   **tri_kw, label="_tri_s")
+
+    # ── B) 3 vertical guides ─────────────────────────────────────────────
+    x_left  = x_crest
+    x_mid_g = 0.5 * (x_crest + x_toe)
+    x_right = x_toe
+
+    z_vbot = z_toe
+    z_vtop = z_crest + 1.25 * H
+    vkw = dict(color="steelblue", lw=1.0, ls=":", alpha=0.60, zorder=2)
+    for xv in (x_left, x_mid_g, x_right):
+        ax.plot([xv, xv], [z_vbot, z_vtop], **vkw, label="_vguide")
+
+    # ── C) 3 horizontal guides ───────────────────────────────────────────
+    z0   = z_crest + 0.00 * H
+    z075 = z_crest + 0.75 * H
+    z3   = z_crest + Z3_FACTOR * H
+
+    x_span_half = 2.0 * H
+    xhmin = min(x_crest, x_toe) - x_span_half
+    xhmax = max(x_crest, x_toe) + x_span_half
+    hkw = dict(color="steelblue", lw=1.0, ls=":", alpha=0.60, zorder=2)
+    for zh in (z0, z075, z3):
+        ax.plot([xhmin, xhmax], [zh, zh], **hkw, label="_hguide")
+
+    # ── D) 9 construction points ─────────────────────────────────────────
+    x_verts = [x_left, x_mid_g, x_right]
+    z_horzs = [z0, z075, z3]
+    pnum = 1
+    for zh in z_horzs:
+        for xv in x_verts:
+            ax.plot(xv, zh, "o", color="steelblue", markersize=5,
+                    zorder=4, label="_Ppt")
+            ax.annotate(
+                f"P{pnum}",
+                xy=(xv, zh),
+                xytext=(4, 4),
+                textcoords="offset points",
+                fontsize=6,
+                color="steelblue",
+                zorder=5,
+            )
+            pnum += 1
+
+    # ── legend proxy for the whole overlay ───────────────────────────────
+    ax.plot([], [], color="steelblue", lw=1.2, ls="--",
+            label="lecture construction (triangle / guides / P1-P9)")
 
 
 def z_surface(y: float, ground_level: float, Z_finish: float, B_top: float, B_base: float) -> float:
@@ -3179,6 +3291,14 @@ if df1 is not None:
             z_plot = np.array([z_surface_half(x, ground_z, z_finish, side_name, B_top_plot, B_base) for x in x_plot])
             ax_slope.axhline(ground_z, color="brown", ls="-", lw=1.6, label="ground")
             ax_slope.plot(x_plot, z_plot, color="darkgreen", lw=2.0, label="surface")
+            # Lecture construction overlay (triangle + guides + P1-P9)
+            plot_lecture_construction(
+                ax_slope,
+                x_crest=float(crest[0]),
+                z_crest=float(crest[1]),
+                x_toe=float(toe[0]),
+                z_toe=float(toe[1]),
+            )
             theta = np.linspace(0.0, 2.0 * math.pi, 360)
             x_full = x_c_sel + R_sel * np.cos(theta)
             z_full = z_c_sel + R_sel * np.sin(theta)
@@ -3195,9 +3315,14 @@ if df1 is not None:
                         continue
                     z_be = z_c_sel - math.sqrt(max(0.0, rad_e))
                     ax_slope.plot([xe, xe], [z_be, z_se], color="black", lw=0.8, alpha=0.45)
-            ax_slope.plot(x_c_sel, z_c_sel, "ko", markersize=6, label="centre")
-            ax_slope.plot(toe[0], toe[1], "bo", markersize=5)
-            ax_slope.plot(crest[0], crest[1], "go", markersize=5)
+            ax_slope.plot(x_c_sel, z_c_sel, "ko", markersize=8, label="centre (selected trial)", zorder=6)
+            # Radius line: centre → toe (solid blue)
+            ax_slope.plot(
+                [x_c_sel, toe[0]], [z_c_sel, toe[1]],
+                color="steelblue", lw=1.8, ls="-", zorder=5, label="radius (centre→toe)",
+            )
+            ax_slope.plot(toe[0], toe[1], "bo", markersize=6, zorder=6)
+            ax_slope.plot(crest[0], crest[1], "go", markersize=6, zorder=6)
             ax_slope.annotate("Toe", xy=(toe[0], toe[1]), xytext=(6, -12), textcoords="offset points")
             ax_slope.annotate("Crest", xy=(crest[0], crest[1]), xytext=(6, 8), textcoords="offset points")
             ax_slope.set_xlim(-half_w, half_w)
@@ -3271,9 +3396,29 @@ if df1 is not None:
         st.dataframe(week2_chainage_df, use_container_width=True, hide_index=True)
         if run_slope_stability and isinstance(slope_stab_result, dict):
             trials_df_debug = slope_stab_result.get("trials_df")
+            geom_debug = slope_stab_result.get("geometry", {})
             if trials_df_debug is not None and len(trials_df_debug) > 0:
                 st.markdown("**Slope trials df**")
                 st.dataframe(trials_df_debug, use_container_width=True, hide_index=True)
+            if geom_debug:
+                _xt = float(geom_debug.get("toe", (0, 0))[0])
+                _xc = float(geom_debug.get("crest", (0, 0))[0])
+                _zt = float(geom_debug.get("toe", (0, 0))[1])
+                _zc = float(geom_debug.get("crest", (0, 0))[1])
+                _H  = float(geom_debug.get("H", 0.0))
+                _dir = 1.0 if _xt > _xc else -1.0
+                st.markdown("**Slope geometry (centre debug)**")
+                st.code(
+                    f"x_crest = {_xc:.3f}   z_crest = {_zc:.3f}\n"
+                    f"x_toe   = {_xt:.3f}   z_toe   = {_zt:.3f}\n"
+                    f"H       = {_H:.3f}\n"
+                    f"dir_to_toe = {_dir:+.0f}  (right-hand slope: +1)\n"
+                    + "\n".join(
+                        f"{row['trial name']}: x_c={row['x_c']:.3f}  z_c={row['z_c']:.3f}  "
+                        f"x_c<x_toe={row['x_c'] < _xt if _dir > 0 else row['x_c'] > _xt}"
+                        for _, row in trials_df_debug.iterrows()
+                    )
+                )
         val_df = pd.DataFrame(settlement_summary)
         st.markdown("**Settlement summary (key chainages)**")
         st.dataframe(val_df, use_container_width=True, hide_index=True)
