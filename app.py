@@ -1552,7 +1552,9 @@ def phi0_slices_fos(surface_z: Callable[[float], float], ground_z: float,
                     gamma_fill: float, gamma_clay: float, n_slices: int) -> tuple:
     """
     phi=0 ordinary method of slices (lecture):
-      F = Σ(cu * b * sec(alpha)) / Σ(W * sin(|alpha|))
+      F = Σ(Cu·b·sec α) / Σ(W·sin α)      ← SIGNED sin α
+      alpha is positive on the driving (toe) side, negative on the passive (crest) side.
+      Passive slices contribute NEGATIVE Di, reducing the net driving force.
     alpha from circle tangent at each slice midpoint:
       dzdx = -(x_mid - x_c)/(z_base - z_c), alpha = atan(dzdx)
     """
@@ -1568,7 +1570,8 @@ def phi0_slices_fos(surface_z: Callable[[float], float], ground_z: float,
         "sum_Ti": 0.0,
         "sum_Di": 0.0,
     }
-    columns = ["slice", "b", "z_surf", "z_base", "h", "A_fill", "A_clay", "W", "alpha_deg", "sec", "sinabs", "Ti", "Di"]
+    columns = ["slice", "b", "z_surf", "z_base", "h", "A_fill", "A_clay", "W",
+               "alpha_deg", "sec(α)", "sin(α)", "Ti=Cu·b·sec", "Di=W·sin"]
     if R <= 0.0 or int(n_slices) <= 0:
         meta["reason"] = "invalid_radius_or_slices"
         return (float("nan"), pd.DataFrame(columns=columns), meta)
@@ -1631,9 +1634,10 @@ def phi0_slices_fos(surface_z: Callable[[float], float], ground_z: float,
                 dzdx = -(x_mid - x_c) / denom
                 alpha = math.atan(dzdx)
             sec_a = 1.0 / max(1e-12, math.cos(alpha))
-            sinabs = math.sin(abs(alpha))
+            # Signed sin: passive (left-side) slices have alpha < 0 → Di < 0 → subtract from driving force
+            sin_a = math.sin(alpha)
             Ti = cu_kpa * b * sec_a
-            Di = W * sinabs
+            Di = W * sin_a
             sum_Ti += Ti
             sum_Di += Di
         rows.append({
@@ -1645,11 +1649,11 @@ def phi0_slices_fos(surface_z: Callable[[float], float], ground_z: float,
             "A_fill": A_fill,
             "A_clay": A_clay,
             "W": W,
-            "alpha_deg": math.degrees(alpha),  # signed alpha (left negative, right positive)
-            "sec": sec_a,
-            "sinabs": sinabs,
-            "Ti": Ti,
-            "Di": Di,
+            "alpha_deg": math.degrees(alpha),  # signed: negative left of centre, positive right
+            "sec(α)": sec_a,
+            "sin(α)": sin_a,            # signed — matches ΣW·sin(α) in lecture formula
+            "Ti=Cu·b·sec": Ti,
+            "Di=W·sin": Di,             # negative for passive slices
         })
     fos = float(sum_Ti / sum_Di) if sum_Di > 0.0 else float("nan")
     slices_df = pd.DataFrame(rows, columns=columns)
@@ -3494,12 +3498,17 @@ if df1 is not None:
 
             with st.expander("Slice table (lecture check)", expanded=False):
                 st.dataframe(slices_df, use_container_width=True, hide_index=True)
-                if trial_meta.get("sum_Di", 0.0) > 0.0 and np.isfinite(float(selected_row["FoS"])):
+                _sTi = trial_meta.get("sum_Ti", float("nan"))
+                _sDi = trial_meta.get("sum_Di", float("nan"))
+                if np.isfinite(float(selected_row["FoS"])):
                     st.caption(
-                        f"ΣTi = {trial_meta.get('sum_Ti', float('nan')):.3f}  |  "
-                        f"ΣDi = {trial_meta.get('sum_Di', float('nan')):.3f}  |  "
-                        f"FoS = ΣTi/ΣDi = {float(selected_row['FoS']):.4f}"
+                        f"**ΣTi = ΣCu·b·sec(α) = {_sTi:.3f}**  |  "
+                        f"**ΣDi = ΣW·sin(α) = {_sDi:.3f}**  "
+                        f"*(signed — passive slices subtract)*  |  "
+                        f"**FoS = {_sTi:.3f} / {_sDi:.3f} = {float(selected_row['FoS']):.4f}**"
                     )
+                else:
+                    st.caption("Trial invalid — check geometry or centre position.")
 
             st.caption("**Values carried forward →** Critical FoS and trial table.")
 
