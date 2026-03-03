@@ -2530,11 +2530,33 @@ if run_btn:
                 gamma_clay=gamma_clay,
                 trial_specs=trial_specs,
             )
+            # Run at all chainages for the full-alignment summary table
+            _all_x = sorted(df1["x"].dropna().unique())
+            _mc_rows = []
+            for _x_ch in _all_x:
+                try:
+                    _td, _ct, _, _ = run_phi0_trials(
+                        df1=df1, x_stability=float(_x_ch), B_top=B_top,
+                        side=stability_side, cu_kpa=cu,
+                        gamma_fill=gamma_fill, gamma_clay=gamma_clay,
+                        trial_specs=trial_specs,
+                    )
+                    _row = {"chainage (m)": float(_x_ch)}
+                    for _, _tr in _td.iterrows():
+                        _fos = _tr["FoS"]
+                        _row[_tr["trial name"]] = round(float(_fos), 3) if np.isfinite(float(_fos)) else None
+                    _ct_fos = float(_ct["FoS"]) if _ct is not None else float("nan")
+                    _row["critical trial"] = _ct["trial name"] if _ct is not None else "—"
+                    _row["min FoS"] = round(_ct_fos, 3) if np.isfinite(_ct_fos) else None
+                    _mc_rows.append(_row)
+                except Exception:
+                    pass
             slope_stab_result = {
                 "trials_df": trials_df,
                 "critical_trial": None if critical_trial is None else critical_trial.to_dict(),
                 "trial_details": trial_details,
                 "geometry": trial_geom,
+                "multi_chainage_df": pd.DataFrame(_mc_rows) if _mc_rows else pd.DataFrame(),
             }
         x0_summary = summarize_x0_settlement_and_consolidation(layer_table_x0, week2_chainage_df)
     csv_note = ""
@@ -3246,73 +3268,203 @@ if df1 is not None:
         critical_trial = slope_stab_result.get("critical_trial")
         trial_details = slope_stab_result.get("trial_details", {})
         geom = slope_stab_result.get("geometry", {})
+        mc_df = slope_stab_result.get("multi_chainage_df", pd.DataFrame())
+
         if trials_df.empty:
             st.error("No slope stability trials were generated.")
         else:
-            st.subheader("Trials Summary")
-            st.dataframe(
-                trials_df[["trial name", "centre", "R", "slices", "FoS", "status"]],
-                use_container_width=True,
-                hide_index=True
-            )
-            if critical_trial is None:
-                st.error("No valid trial found (check centre descriptors or geometry constraints such as R <= 4H).")
-            else:
+            # ── geometry shared by all sub-sections ────────────────────────────
+            side_name   = geom.get("side", "Right")
+            ground_z    = float(geom.get("ground_z", 0.0))
+            z_finish    = float(geom.get("z_finish", 0.0))
+            B_base      = float(geom.get("B_base", 0.0))
+            B_top_plot  = float(geom.get("B_top", B_top))
+            toe         = geom.get("toe",   (B_base / 2.0, ground_z))
+            crest       = geom.get("crest", (B_top_plot / 2.0, z_finish))
+            H_emb       = float(geom.get("H", 1.0))
+            half_w      = max(80.0, B_base / 2.0 + max(25.0, 4.5 * max(1.0, H_emb)))
+            x_plot      = np.linspace(-half_w, half_w, 300)
+            z_plot      = np.array([z_surface_half(x, ground_z, z_finish, side_name, B_top_plot, B_base)
+                                    for x in x_plot])
+
+            # ── per-trial colour palette ────────────────────────────────────────
+            _TRIAL_COLOURS = ["#e41a1c", "#ff7f00", "#4daf4a",
+                               "#984ea3", "#377eb8", "#a65628"]
+            trial_names = trials_df["trial name"].tolist()
+            _col = {n: _TRIAL_COLOURS[i % len(_TRIAL_COLOURS)]
+                    for i, n in enumerate(trial_names)}
+
+            # ══════════════════════════════════════════════════════════════════
+            # A) All-trials FoS summary (metric row)
+            # ══════════════════════════════════════════════════════════════════
+            st.subheader(f"All Trials — x = {x_stability:.0f} m")
+
+            _crit_name = critical_trial["trial name"] if critical_trial is not None else None
+            _cols = st.columns(len(trial_names))
+            for _col_ui, (_, _tr) in zip(_cols, trials_df.iterrows()):
+                _fos = _tr["FoS"]
+                _is_crit = _tr["trial name"] == _crit_name
+                _label = ("★ " if _is_crit else "") + _tr["trial name"]
+                if np.isfinite(float(_fos)):
+                    _delta = ("critical" if _is_crit else
+                              ("✓ Pass" if float(_fos) >= min_FOS_required else "✗ Fail"))
+                    _col_ui.metric(_label, f"{float(_fos):.3f}", delta=_delta)
+                else:
+                    _col_ui.metric(_label, "—", delta=str(_tr.get("status", "invalid")))
+
+            if critical_trial is not None:
                 min_FOS = float(critical_trial["FoS"])
                 pass_fail = "✓ Pass" if min_FOS >= min_FOS_required else "✗ Fail"
-                st.metric("Critical FoS", f"{min_FOS:.3f}", delta=pass_fail)
                 st.markdown(
-                    f"**Critical trial:** {critical_trial['trial name']} | "
-                    f"**Centre:** ({critical_trial['x_c']:.3f}, {critical_trial['z_c']:.3f}) | "
-                    f"**R:** {critical_trial['R']:.3f} m"
+                    f"**Critical trial:** {critical_trial['trial name']} &nbsp;|&nbsp; "
+                    f"**FoS = {min_FOS:.3f}** &nbsp;|&nbsp; {pass_fail} &nbsp;|&nbsp; "
+                    f"R = {critical_trial['R']:.3f} m"
                 )
-            trial_names = trials_df["trial name"].tolist()
+            else:
+                st.error("No valid trial found (check centre descriptors or geometry constraints such as R ≤ 4H).")
+
+            st.dataframe(
+                trials_df[["trial name", "centre", "R", "slices", "FoS", "status"]],
+                use_container_width=True, hide_index=True,
+            )
+
+            # ══════════════════════════════════════════════════════════════════
+            # B) All-trials overlay plot
+            # ══════════════════════════════════════════════════════════════════
+            st.subheader("All Trials — Overlay Plot")
+            fig_all, ax_all = plt.subplots(figsize=(12, 7))
+            ax_all.set_xlabel("Horizontal y (m)")
+            ax_all.set_ylabel("Level (mAOD)")
+            ax_all.set_title(f"All 6 Trials — x = {x_stability:.0f} m  (φ=0 method)")
+            ax_all.axhline(ground_z, color="brown", ls="-", lw=1.6, label="ground")
+            ax_all.plot(x_plot, z_plot, color="darkgreen", lw=2.2, label="embankment surface")
+            plot_lecture_construction(
+                ax_all,
+                x_crest=float(crest[0]), z_crest=float(crest[1]),
+                x_toe=float(toe[0]),     z_toe=float(toe[1]),
+            )
+            ax_all.plot(toe[0],   toe[1],   "bo", markersize=7, zorder=7)
+            ax_all.plot(crest[0], crest[1], "go", markersize=7, zorder=7)
+            ax_all.annotate("Toe",   xy=(toe[0],   toe[1]),   xytext=(6, -14), textcoords="offset points", fontsize=8)
+            ax_all.annotate("Crest", xy=(crest[0], crest[1]), xytext=(6,   8), textcoords="offset points", fontsize=8)
+            _z_lo = ground_z - 2.5 * max(1.0, H_emb)
+            _z_hi = z_finish + 2.0
+            for _, _tr in trials_df.iterrows():
+                _name = _tr["trial name"]
+                _colour = _col[_name]
+                _xc, _zc, _R = float(_tr["x_c"]), float(_tr["z_c"]), float(_tr["R"])
+                _is_crit = _name == _crit_name
+                _lw_arc  = 3.2 if _is_crit else 1.8
+                _alpha_c = 1.0 if _is_crit else 0.55
+                # full ghost circle
+                _theta = np.linspace(0.0, 2.0 * math.pi, 360)
+                ax_all.plot(_xc + _R * np.cos(_theta), _zc + _R * np.sin(_theta),
+                            color=_colour, lw=0.8, alpha=0.25, zorder=3)
+                # slip arc
+                _meta = trial_details.get(_name, (pd.DataFrame(), {}))[1]
+                if np.isfinite(float(_tr["FoS"])) and _meta.get("x_L") is not None:
+                    _xa = np.linspace(float(_meta["x_L"]), float(_meta["x_R"]), 240)
+                    _za = _zc - np.sqrt(np.maximum(0.0, _R**2 - (_xa - _xc)**2))
+                    _fos_lbl = f"{_name} FoS={float(_tr['FoS']):.3f}"
+                    ax_all.plot(_xa, _za, color=_colour, lw=_lw_arc, alpha=_alpha_c,
+                                label=_fos_lbl, zorder=4)
+                    _z_lo = min(_z_lo, float(_zc - _R - 1.5))
+                    _z_hi = max(_z_hi, float(_zc + _R + 1.5))
+                else:
+                    ax_all.plot([], [], color=_colour, lw=1.6,
+                                label=f"{_name} — invalid", zorder=4)
+                # centre marker
+                ax_all.plot(_xc, _zc, "o", color=_colour,
+                            markersize=10 if _is_crit else 7,
+                            markeredgecolor="black", markeredgewidth=0.8 if _is_crit else 0,
+                            zorder=6, alpha=_alpha_c)
+                # radius line
+                ax_all.plot([_xc, toe[0]], [_zc, toe[1]],
+                            color=_colour, lw=1.2, ls="--", alpha=0.5, zorder=5)
+                # FoS annotation near centre
+                if np.isfinite(float(_tr["FoS"])):
+                    ax_all.annotate(
+                        f"{float(_tr['FoS']):.2f}",
+                        xy=(_xc, _zc), xytext=(4, 4),
+                        textcoords="offset points",
+                        fontsize=7, color=_colour, fontweight="bold", zorder=7,
+                    )
+            ax_all.set_xlim(-half_w, half_w)
+            ax_all.set_ylim(_z_lo, _z_hi)
+            ax_all.grid(True, alpha=0.3)
+            ax_all.legend(loc="upper left", fontsize=8, framealpha=0.85)
+            ax_all.set_aspect("equal", adjustable="box")
+            plt.tight_layout()
+            st.pyplot(fig_all)
+            plt.close()
+
+            # ══════════════════════════════════════════════════════════════════
+            # C) All-chainages FoS summary table
+            # ══════════════════════════════════════════════════════════════════
+            if mc_df is not None and not mc_df.empty:
+                st.subheader("FoS at All Chainages")
+                _t_cols = [c for c in mc_df.columns if "Trial" in str(c)]
+                # colour-code: green ≥ required, red < required, grey = None
+                def _fos_colour(val):
+                    if val is None or (isinstance(val, float) and math.isnan(val)):
+                        return "color: #999999"
+                    try:
+                        v = float(val)
+                        if v >= min_FOS_required:
+                            return "color: #2c7e2c; font-weight: bold"
+                        return "color: #cc2222; font-weight: bold"
+                    except Exception:
+                        return ""
+                _mc_display = mc_df.copy()
+                _mc_display["chainage (m)"] = _mc_display["chainage (m)"].astype(int)
+                _style = _mc_display.style.applymap(_fos_colour, subset=_t_cols + ["min FoS"])
+                st.dataframe(_style, use_container_width=True, hide_index=True)
+                # Highlight the chainage used for detailed analysis
+                st.caption(
+                    f"Detailed analysis above uses x = {x_stability:.0f} m. "
+                    f"Green = FoS ≥ {min_FOS_required:.2f}, Red = below target."
+                )
+
+            # ══════════════════════════════════════════════════════════════════
+            # D) Selected-trial detail (slices, plot with hatching)
+            # ══════════════════════════════════════════════════════════════════
+            st.subheader("Single-Trial Detail")
             default_name = critical_trial["trial name"] if critical_trial is not None else trial_names[0]
-            default_idx = trial_names.index(default_name) if default_name in trial_names else 0
+            default_idx  = trial_names.index(default_name) if default_name in trial_names else 0
             selected_trial = st.selectbox(
-                "Select trial for plotting and slice table",
-                trial_names,
-                index=default_idx,
-                key="phi0_trial_select",
+                "Select trial for detailed slice plot",
+                trial_names, index=default_idx, key="phi0_trial_select",
             )
             selected_row = trials_df.loc[trials_df["trial name"] == selected_trial].iloc[0]
             slices_df, trial_meta = trial_details.get(selected_trial, (pd.DataFrame(), {}))
-            side_name = geom.get("side", "Right")
-            ground_z = float(geom.get("ground_z", 0.0))
-            z_finish = float(geom.get("z_finish", 0.0))
-            B_base = float(geom.get("B_base", 0.0))
-            B_top_plot = float(geom.get("B_top", B_top))
-            toe = geom.get("toe", (B_base / 2.0, ground_z))
-            crest = geom.get("crest", (B_top_plot / 2.0, z_finish))
             x_c_sel = float(selected_row["x_c"])
             z_c_sel = float(selected_row["z_c"])
-            R_sel = float(selected_row["R"])
-            fig_slope, ax_slope = plt.subplots(figsize=(10, 6))
+            R_sel   = float(selected_row["R"])
+            _sel_colour = _col.get(selected_trial, "red")
+
+            fig_slope, ax_slope = plt.subplots(figsize=(11, 6))
             ax_slope.set_xlabel("Horizontal y (m)")
             ax_slope.set_ylabel("Level (mAOD)")
-            ax_slope.set_title(f"{selected_trial} at x = {x_stability:.0f} m")
-            half_w = max(80.0, B_base / 2.0 + max(25.0, 4.5 * max(1.0, geom.get("H", 1.0))))
-            x_plot = np.linspace(-half_w, half_w, 300)
-            z_plot = np.array([z_surface_half(x, ground_z, z_finish, side_name, B_top_plot, B_base) for x in x_plot])
+            ax_slope.set_title(f"{selected_trial} — x = {x_stability:.0f} m  "
+                               f"(FoS = {float(selected_row['FoS']):.3f})" if np.isfinite(float(selected_row["FoS"]))
+                               else f"{selected_trial} — invalid")
             ax_slope.axhline(ground_z, color="brown", ls="-", lw=1.6, label="ground")
             ax_slope.plot(x_plot, z_plot, color="darkgreen", lw=2.0, label="surface")
-            # Lecture construction overlay (triangle + guides + P1-P9)
             plot_lecture_construction(
                 ax_slope,
-                x_crest=float(crest[0]),
-                z_crest=float(crest[1]),
-                x_toe=float(toe[0]),
-                z_toe=float(toe[1]),
+                x_crest=float(crest[0]), z_crest=float(crest[1]),
+                x_toe=float(toe[0]),     z_toe=float(toe[1]),
             )
-            theta = np.linspace(0.0, 2.0 * math.pi, 360)
-            x_full = x_c_sel + R_sel * np.cos(theta)
-            z_full = z_c_sel + R_sel * np.sin(theta)
-            ax_slope.plot(x_full, z_full, color="gray", lw=1.0, alpha=0.35, label="full circle")
-            if np.isfinite(selected_row["FoS"]) and trial_meta.get("x_L") is not None and trial_meta.get("x_R") is not None:
+            _theta = np.linspace(0.0, 2.0 * math.pi, 360)
+            ax_slope.plot(x_c_sel + R_sel * np.cos(_theta),
+                          z_c_sel + R_sel * np.sin(_theta),
+                          color="gray", lw=1.0, alpha=0.35, label="full circle")
+            if np.isfinite(float(selected_row["FoS"])) and trial_meta.get("x_L") is not None:
                 x_arc = np.linspace(float(trial_meta["x_L"]), float(trial_meta["x_R"]), 240)
                 z_arc = z_c_sel - np.sqrt(np.maximum(0.0, R_sel**2 - (x_arc - x_c_sel)**2))
-                ax_slope.plot(x_arc, z_arc, "r-", lw=2.8, label="slip arc")
-                x_edges = np.linspace(float(trial_meta["x_L"]), float(trial_meta["x_R"]), int(selected_row["slices"]) + 1)
+                ax_slope.plot(x_arc, z_arc, color=_sel_colour, lw=3.0, label="slip arc")
+                x_edges = np.linspace(float(trial_meta["x_L"]), float(trial_meta["x_R"]),
+                                      int(selected_row["slices"]) + 1)
                 for xe in x_edges:
                     z_se = z_surface_half(float(xe), ground_z, z_finish, side_name, B_top_plot, B_base)
                     rad_e = R_sel**2 - (float(xe) - x_c_sel)**2
@@ -3320,32 +3472,35 @@ if df1 is not None:
                         continue
                     z_be = z_c_sel - math.sqrt(max(0.0, rad_e))
                     ax_slope.plot([xe, xe], [z_be, z_se], color="black", lw=0.8, alpha=0.45)
-            ax_slope.plot(x_c_sel, z_c_sel, "ko", markersize=8, label="centre (selected trial)", zorder=6)
-            # Radius line: centre → toe (solid blue)
-            ax_slope.plot(
-                [x_c_sel, toe[0]], [z_c_sel, toe[1]],
-                color="steelblue", lw=1.8, ls="-", zorder=5, label="radius (centre→toe)",
-            )
-            ax_slope.plot(toe[0], toe[1], "bo", markersize=6, zorder=6)
+            ax_slope.plot(x_c_sel, z_c_sel, "o", color=_sel_colour,
+                          markersize=10, markeredgecolor="black", markeredgewidth=1.0,
+                          label="centre", zorder=6)
+            ax_slope.plot([x_c_sel, toe[0]], [z_c_sel, toe[1]],
+                          color=_sel_colour, lw=1.8, ls="-", zorder=5, label="radius (centre→toe)")
+            ax_slope.plot(toe[0],   toe[1],   "bo", markersize=6, zorder=6)
             ax_slope.plot(crest[0], crest[1], "go", markersize=6, zorder=6)
-            ax_slope.annotate("Toe", xy=(toe[0], toe[1]), xytext=(6, -12), textcoords="offset points")
-            ax_slope.annotate("Crest", xy=(crest[0], crest[1]), xytext=(6, 8), textcoords="offset points")
+            ax_slope.annotate("Toe",   xy=(toe[0],   toe[1]),   xytext=(6, -12), textcoords="offset points")
+            ax_slope.annotate("Crest", xy=(crest[0], crest[1]), xytext=(6,   8), textcoords="offset points")
             ax_slope.set_xlim(-half_w, half_w)
-            ax_slope.set_ylim(min(ground_z - 2.5 * max(1.0, geom.get("H", 1.0)), z_c_sel - R_sel - 2.0), max(z_finish + 4.0, z_c_sel + R_sel + 2.0))
+            _y_lo = min(ground_z - 2.5 * max(1.0, H_emb), z_c_sel - R_sel - 2.0)
+            _y_hi = max(z_finish + 4.0, z_c_sel + R_sel + 2.0)
+            ax_slope.set_ylim(_y_lo, _y_hi)
             ax_slope.grid(True, alpha=0.3)
-            ax_slope.legend(loc="upper left")
+            ax_slope.legend(loc="upper left", fontsize=8, framealpha=0.85)
             ax_slope.set_aspect("equal", adjustable="box")
             plt.tight_layout()
             st.pyplot(fig_slope)
             plt.close()
-            with st.expander("Show slice table (lecture check)", expanded=False):
+
+            with st.expander("Slice table (lecture check)", expanded=False):
                 st.dataframe(slices_df, use_container_width=True, hide_index=True)
-            if trial_meta.get("sum_Di", 0.0) > 0.0:
-                st.caption(
-                    f"Lecture sums: ΣTi={trial_meta.get('sum_Ti', float('nan')):.3f}, "
-                    f"ΣDi={trial_meta.get('sum_Di', float('nan')):.3f}, "
-                    f"FoS=ΣTi/ΣDi={selected_row['FoS']:.4f}" if np.isfinite(selected_row["FoS"]) else "Selected trial is invalid."
-                )
+                if trial_meta.get("sum_Di", 0.0) > 0.0 and np.isfinite(float(selected_row["FoS"])):
+                    st.caption(
+                        f"ΣTi = {trial_meta.get('sum_Ti', float('nan')):.3f}  |  "
+                        f"ΣDi = {trial_meta.get('sum_Di', float('nan')):.3f}  |  "
+                        f"FoS = ΣTi/ΣDi = {float(selected_row['FoS']):.4f}"
+                    )
+
             st.caption("**Values carried forward →** Critical FoS and trial table.")
 
     # -------------------------------------------------------------------------
