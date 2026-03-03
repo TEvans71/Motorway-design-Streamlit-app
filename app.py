@@ -1588,7 +1588,8 @@ def _build_slope_stability_centres(toe: tuple, crest: tuple, H: float) -> dict:
 
 def phi0_slices_fos(surface_z: Callable[[float], float], ground_z: float,
                     toe: tuple, crest: tuple, side: str, centre: tuple, cu_kpa: float,
-                    gamma_fill: float, gamma_clay: float, n_slices: int) -> tuple:
+                    gamma_fill: float, gamma_clay: float, n_slices: int,
+                    x_L: float | None = None, x_R: float | None = None) -> tuple:
     """
     phi=0 ordinary method of slices (lecture):
       F = Σ(Cu·b·sec α) / Σ(W·sin α)
@@ -1608,59 +1609,67 @@ def phi0_slices_fos(surface_z: Callable[[float], float], ground_z: float,
         "sum_Di": 0.0,
     }
     columns = [
-        "slice_no", "x_mid", "b_m", "z_top", "z_bottom", "area_m2", "gamma_kN_per_m3", "W_kN",
+        "slice_no", "x_mid", "b_m", "z_top", "z_bottom", "area_m2",
+        "gamma_fill_kN_per_m3", "gamma_clay_kN_per_m3",
+        "W_fill_kN", "W_clay_kN", "W_kN", "gamma_avg_kN_per_m3 (derived)",
         "alpha_rad", "alpha_deg", "sec_alpha", "W_sin_alpha", "cu_kPa", "Ti_cubseca", "Di_Wsina",
     ]
     if R <= 0.0 or int(n_slices) <= 0:
         meta["reason"] = "invalid_radius_or_slices"
         return (float("nan"), pd.DataFrame(columns=columns), meta)
     x_crest = float(crest[0])
+    x_int = None
 
-    # Find second intersection using the FULL ground profile:
-    # horizontal crest/platform + slope face + horizontal ground line.
-    x_scan_min = min(x_c - R, x_toe, x_crest) - max(1.0, 0.05 * max(1.0, R))
-    x_scan_max = max(x_c + R, x_toe, x_crest) + max(1.0, 0.05 * max(1.0, R))
-    xs_scan = np.linspace(x_scan_min, x_scan_max, max(1200, int(n_slices) * 160))
-    z_ground_scan = np.array([surface_z(float(x)) for x in xs_scan], dtype=float)
-    rad_scan = R**2 - (xs_scan - x_c) ** 2
-    z_circle_lower = np.full_like(xs_scan, np.nan, dtype=float)
-    ok_scan = rad_scan >= 0.0
-    z_circle_lower[ok_scan] = z_c - np.sqrt(rad_scan[ok_scan])
-    diff = z_ground_scan - z_circle_lower
-    hit_tol = max(1e-3, 1e-4 * max(1.0, R))
-    roots_ground = []
-    for i in range(len(xs_scan) - 1):
-        d1 = float(diff[i])
-        d2 = float(diff[i + 1])
-        if not (np.isfinite(d1) and np.isfinite(d2)):
-            continue
-        x1 = float(xs_scan[i])
-        x2 = float(xs_scan[i + 1])
-        if abs(d1) <= hit_tol:
-            roots_ground.append(x1)
-        if d1 * d2 < 0.0:
-            x_root = x1 - d1 * (x2 - x1) / (d2 - d1)
-            roots_ground.append(float(x_root))
-    if np.isfinite(diff[-1]) and abs(float(diff[-1])) <= hit_tol:
-        roots_ground.append(float(xs_scan[-1]))
-    roots_ground = sorted(roots_ground)
-    roots_ground_uniq = []
-    root_tol = max(1e-4, 1e-5 * max(1.0, R))
-    for xr in roots_ground:
-        if not roots_ground_uniq or abs(xr - roots_ground_uniq[-1]) > root_tol:
-            roots_ground_uniq.append(float(xr))
+    if x_L is not None and x_R is not None:
+        x_L = float(x_L)
+        x_R = float(x_R)
+    else:
+        # Find second intersection using the FULL ground profile:
+        # horizontal crest/platform + slope face + horizontal ground line.
+        x_scan_min = min(x_c - R, x_toe, x_crest) - max(1.0, 0.05 * max(1.0, R))
+        x_scan_max = max(x_c + R, x_toe, x_crest) + max(1.0, 0.05 * max(1.0, R))
+        xs_scan = np.linspace(x_scan_min, x_scan_max, max(1200, int(n_slices) * 160))
+        z_ground_scan = np.array([surface_z(float(x)) for x in xs_scan], dtype=float)
+        rad_scan = R**2 - (xs_scan - x_c) ** 2
+        z_circle_lower = np.full_like(xs_scan, np.nan, dtype=float)
+        ok_scan = rad_scan >= 0.0
+        z_circle_lower[ok_scan] = z_c - np.sqrt(rad_scan[ok_scan])
+        diff = z_ground_scan - z_circle_lower
+        hit_tol = max(1e-3, 1e-4 * max(1.0, R))
+        roots_ground = []
+        for i in range(len(xs_scan) - 1):
+            d1 = float(diff[i])
+            d2 = float(diff[i + 1])
+            if not (np.isfinite(d1) and np.isfinite(d2)):
+                continue
+            x1 = float(xs_scan[i])
+            x2 = float(xs_scan[i + 1])
+            if abs(d1) <= hit_tol:
+                roots_ground.append(x1)
+            if d1 * d2 < 0.0:
+                x_root = x1 - d1 * (x2 - x1) / (d2 - d1)
+                roots_ground.append(float(x_root))
+        if np.isfinite(diff[-1]) and abs(float(diff[-1])) <= hit_tol:
+            roots_ground.append(float(xs_scan[-1]))
+        roots_ground = sorted(roots_ground)
+        roots_ground_uniq = []
+        root_tol = max(1e-4, 1e-5 * max(1.0, R))
+        for xr in roots_ground:
+            if not roots_ground_uniq or abs(xr - roots_ground_uniq[-1]) > root_tol:
+                roots_ground_uniq.append(float(xr))
 
-    toe_tol = 1e-3
-    roots_non_toe = [float(xr) for xr in roots_ground_uniq if abs(float(xr) - x_toe) >= toe_tol]
-    if len(roots_non_toe) == 0:
-        meta["reason"] = "no_second_intersection_with_ground_profile"
-        meta["roots_ground"] = roots_ground_uniq
-        return (float("nan"), pd.DataFrame(columns=columns), meta)
-    x_int = float(min(roots_non_toe, key=lambda xr: abs(float(xr) - x_toe)))
-    x_L, x_R = float(min(x_int, x_toe)), float(max(x_int, x_toe))
+        toe_tol = 1e-3
+        roots_non_toe = [float(xr) for xr in roots_ground_uniq if abs(float(xr) - x_toe) >= toe_tol]
+        if len(roots_non_toe) == 0:
+            meta["reason"] = "no_second_intersection_with_ground_profile"
+            meta["roots_ground"] = roots_ground_uniq
+            return (float("nan"), pd.DataFrame(columns=columns), meta)
+        x_int = float(min(roots_non_toe, key=lambda xr: abs(float(xr) - x_toe)))
+        x_L, x_R = float(min(x_int, x_toe)), float(max(x_int, x_toe))
+
     if x_R - x_L <= 1e-9:
         meta["reason"] = "degenerate_intersection_span"
-        meta["x_L"], meta["x_R"] = x_L, x_R
+        meta["x_L"], meta["x_R"] = float(x_L), float(x_R)
         return (float("nan"), pd.DataFrame(columns=columns), meta)
     x_edges = np.linspace(x_L, x_R, int(n_slices) + 1)
 
@@ -1681,8 +1690,10 @@ def phi0_slices_fos(surface_z: Callable[[float], float], ground_z: float,
             A_fill = 0.0
             A_clay = 0.0
             area_m2 = 0.0
-            gamma_eff = float("nan")
+            W_fill = 0.0
+            W_clay = 0.0
             W = 0.0
+            gamma_avg = float("nan")
             alpha = 0.0
             sec_a = 1.0
             sin_a = 0.0
@@ -1694,8 +1705,10 @@ def phi0_slices_fos(surface_z: Callable[[float], float], ground_z: float,
             A_fill = max(0.0, z_top - max(z_bottom, ground_z)) * b
             A_clay = max(0.0, min(z_top, ground_z) - z_bottom) * b
             area_m2 = A_fill + A_clay
-            W = gamma_fill * A_fill + gamma_clay * A_clay
-            gamma_eff = (W / area_m2) if area_m2 > 0.0 else float("nan")
+            W_fill = gamma_fill * A_fill
+            W_clay = gamma_clay * A_clay
+            W = W_fill + W_clay
+            gamma_avg = W / max(1e-12, area_m2)
             denom = z_bottom - z_c
             if abs(denom) < 1e-12:
                 alpha = 0.0
@@ -1705,7 +1718,7 @@ def phi0_slices_fos(surface_z: Callable[[float], float], ground_z: float,
             sec_a = 1.0 / max(1e-12, math.cos(alpha))
             sin_a = math.sin(alpha)
             Ti = cu_kPa * b * sec_a
-            Di = W * sin_a
+            Di = W * abs(sin_a)
             sum_Ti += Ti
             sum_Di += Di
         rows.append({
@@ -1715,8 +1728,12 @@ def phi0_slices_fos(surface_z: Callable[[float], float], ground_z: float,
             "z_top": z_top,
             "z_bottom": z_bottom,
             "area_m2": area_m2,
-            "gamma_kN_per_m3": gamma_eff,
+            "gamma_fill_kN_per_m3": float(gamma_fill),
+            "gamma_clay_kN_per_m3": float(gamma_clay),
+            "W_fill_kN": W_fill,
+            "W_clay_kN": W_clay,
             "W_kN": W,
+            "gamma_avg_kN_per_m3 (derived)": gamma_avg,
             "alpha_rad": alpha,
             "alpha_deg": math.degrees(alpha),
             "sec_alpha": sec_a,
@@ -1781,7 +1798,9 @@ def run_phi0_trials(df1: pd.DataFrame, x_stability: float, B_top: float, side: s
         z_c = float(c["z"])
         R = float(math.hypot(x_c - toe[0], z_c - toe[1]))
         slices_df = pd.DataFrame(columns=[
-            "slice_no", "x_mid", "b_m", "z_top", "z_bottom", "area_m2", "gamma_kN_per_m3", "W_kN",
+            "slice_no", "x_mid", "b_m", "z_top", "z_bottom", "area_m2",
+            "gamma_fill_kN_per_m3", "gamma_clay_kN_per_m3",
+            "W_fill_kN", "W_clay_kN", "W_kN", "gamma_avg_kN_per_m3 (derived)",
             "alpha_rad", "alpha_deg", "sec_alpha", "W_sin_alpha", "cu_kPa", "Ti_cubseca", "Di_Wsina",
         ])
         rad_diag = R * R - (xs_diag - x_c) ** 2
@@ -1829,25 +1848,6 @@ def run_phi0_trials(df1: pd.DataFrame, x_stability: float, B_top: float, side: s
         if H <= 0.0:
             meta["reason"] = "zero_embankment_height"
         else:
-            fos, slices_df, calc_meta = phi0_slices_fos(
-                surface_z=surface_fn,
-                ground_z=ground_z,
-                toe=toe,
-                crest=crest,
-                side=side_name,
-                centre=(x_c, z_c),
-                cu_kpa=cu_kpa,
-                gamma_fill=gamma_fill,
-                gamma_clay=gamma_clay,
-                n_slices=int(n_slices),
-            )
-            meta.update(calc_meta)
-            if "sum_Ti" in calc_meta:
-                meta["sum_Ti"] = calc_meta.get("sum_Ti")
-            if "sum_Di" in calc_meta:
-                meta["sum_Di"] = calc_meta.get("sum_Di")
-            sum_Di_meta = meta.get("sum_Di")
-            slices_computed = slices_df is not None and not slices_df.empty
             if not meta.get("has_real_circle_points", False):
                 meta["reason"] = "no_real_circle_points_in_plot_range"
             elif int(meta.get("mask_true_count", 0)) == 0:
@@ -1860,13 +1860,35 @@ def run_phi0_trials(df1: pd.DataFrame, x_stability: float, B_top: float, side: s
                 or (float(meta.get("x_max_arc")) - float(meta.get("x_min_arc"))) < 1e-6
             ):
                 meta["reason"] = "degenerate_arc_span"
-            elif slices_computed and (sum_Di_meta is not None) and (float(sum_Di_meta) <= 0.0):
-                meta["reason"] = "zero_or_negative_driving_sum"
-            elif not np.isfinite(fos):
-                meta["reason"] = "numerical_failure"
             else:
-                meta["reason"] = None
-                meta["valid"] = True
+                fos, slices_df, calc_meta = phi0_slices_fos(
+                    surface_z=surface_fn,
+                    ground_z=ground_z,
+                    toe=toe,
+                    crest=crest,
+                    side=side_name,
+                    centre=(x_c, z_c),
+                    cu_kpa=cu_kpa,
+                    gamma_fill=gamma_fill,
+                    gamma_clay=gamma_clay,
+                    n_slices=int(n_slices),
+                    x_L=float(meta.get("x_min_arc")),
+                    x_R=float(meta.get("x_max_arc")),
+                )
+                meta.update(calc_meta)
+                if "sum_Ti" in calc_meta:
+                    meta["sum_Ti"] = calc_meta.get("sum_Ti")
+                if "sum_Di" in calc_meta:
+                    meta["sum_Di"] = calc_meta.get("sum_Di")
+                sum_Di_meta = meta.get("sum_Di")
+                slices_computed = slices_df is not None and not slices_df.empty
+                if slices_computed and (sum_Di_meta is not None) and (float(sum_Di_meta) <= 0.0):
+                    meta["reason"] = "zero_or_negative_driving_sum"
+                elif not np.isfinite(fos):
+                    meta["reason"] = "numerical_failure"
+                else:
+                    meta["reason"] = None
+                    meta["valid"] = True
         meta["trial_id"] = trial_id
         meta["x_c"] = x_c
         meta["z_c"] = z_c
@@ -3707,26 +3729,85 @@ if df1 is not None:
     # 6) Slope Stability (Undrained Circular Slip)
     # -------------------------------------------------------------------------
     st.header("Slope Stability (Undrained Circular Slip)")
-    with st.expander("Inputs used (read-only)", expanded=False):
-        slope_inputs_section_df = build_input_summary_df([
-            {"Parameter": "Run slope stability", "Symbol": "-", "Value": bool(run_slope_stability), "Units": ""},
-            {"Parameter": "Side", "Symbol": "-", "Value": str(stability_side), "Units": ""},
-            {"Parameter": "x_stability", "Symbol": "x", "Value": float(x_stability), "Units": "m"},
-            {"Parameter": "Undrained shear strength (slope section fixed)", "Symbol": "c_u", "Value": float(SLOPE_STABILITY_CU_KPA), "Units": "kPa"},
-            {"Parameter": "Fill unit weight", "Symbol": "gamma_fill", "Value": float(gamma_fill), "Units": "kN/m^3"},
-            {"Parameter": "Clay unit weight", "Symbol": "gamma_clay", "Value": float(gamma_clay), "Units": "kN/m^3"},
-            {"Parameter": "Slices", "Symbol": "n", "Value": int(n_slices), "Units": "-"},
-            {"Parameter": "Minimum FoS required", "Symbol": "FoS_min", "Value": float(min_FOS_required), "Units": "-"},
-        ])
-        st.dataframe(slope_inputs_section_df, use_container_width=True, hide_index=True)
+    if "slope_inputs_sig" not in st.session_state:
+        st.session_state["slope_inputs_sig"] = None
+    if "slope_trials_cache" not in st.session_state:
+        st.session_state["slope_trials_cache"] = None
+    if "slope_selected_trial" not in st.session_state:
+        st.session_state["slope_selected_trial"] = "H"
+
+    with st.form("slope_form"):
+        with st.expander("Inputs used (read-only)", expanded=False):
+            slope_inputs_section_df = build_input_summary_df([
+                {"Parameter": "Run slope stability", "Symbol": "-", "Value": bool(run_slope_stability), "Units": ""},
+                {"Parameter": "Side", "Symbol": "-", "Value": str(stability_side), "Units": ""},
+                {"Parameter": "x_stability", "Symbol": "x", "Value": float(x_stability), "Units": "m"},
+                {"Parameter": "Undrained shear strength (slope section fixed)", "Symbol": "c_u", "Value": float(SLOPE_STABILITY_CU_KPA), "Units": "kPa"},
+                {"Parameter": "Fill unit weight", "Symbol": "gamma_fill", "Value": float(gamma_fill), "Units": "kN/m^3"},
+                {"Parameter": "Clay unit weight", "Symbol": "gamma_clay", "Value": float(gamma_clay), "Units": "kN/m^3"},
+                {"Parameter": "Slices", "Symbol": "n", "Value": int(n_slices), "Units": "-"},
+                {"Parameter": "Minimum FoS required", "Symbol": "FoS_min", "Value": float(min_FOS_required), "Units": "-"},
+            ])
+            st.dataframe(slope_inputs_section_df, use_container_width=True, hide_index=True)
+        slope_run_btn = st.form_submit_button("Run slope stability")
+
     if not run_slope_stability:
         st.info("Slope stability is OFF. Tick 'Run slope stability analysis' in the sidebar and click Run to compute.")
-    elif slope_stab_result is None:
-        st.warning("Slope stability was not run in the last calculation. Ensure the checkbox is enabled and click Run.")
     else:
-        trials_df = slope_stab_result.get("trials_df", pd.DataFrame())
-        trial_details = slope_stab_result.get("trial_details", {})
-        geom = slope_stab_result.get("geometry", {})
+        idx_stab = (df1["x"] - float(x_stability)).abs().idxmin()
+        row_stab = df1.loc[idx_stab]
+        sig = (
+            float(x_stability),
+            float(B_top),
+            str(stability_side),
+            float(gamma_fill),
+            float(gamma_clay),
+            int(n_slices),
+            float(SLOPE_STABILITY_CU_KPA),
+            float(row_stab["ground"]),
+            float(row_stab["Z_finish"]),
+            float(row_stab["B_base"]),
+        )
+        sig_changed = sig != st.session_state["slope_inputs_sig"]
+
+        if st.session_state["slope_trials_cache"] is None and isinstance(slope_stab_result, dict):
+            st.session_state["slope_trials_cache"] = {
+                "trials_df": slope_stab_result.get("trials_df", pd.DataFrame()),
+                "trial_details": slope_stab_result.get("trial_details", {}),
+                "geometry": slope_stab_result.get("geometry", {}),
+            }
+            st.session_state["slope_inputs_sig"] = sig
+            sig_changed = False
+
+        should_recompute = bool(slope_run_btn or sig_changed or st.session_state["slope_trials_cache"] is None)
+        if should_recompute:
+            trials_df_new, trial_details_new, trial_geom_new = run_phi0_trials(
+                df1=df1,
+                x_stability=x_stability,
+                B_top=B_top,
+                side=stability_side,
+                gamma_fill=gamma_fill,
+                gamma_clay=gamma_clay,
+                n_slices=int(n_slices),
+                cu_kpa=SLOPE_STABILITY_CU_KPA,
+            )
+            st.session_state["slope_inputs_sig"] = sig
+            st.session_state["slope_trials_cache"] = {
+                "trials_df": trials_df_new,
+                "trial_details": trial_details_new,
+                "geometry": trial_geom_new,
+            }
+
+        slope_stab_result = st.session_state["slope_trials_cache"]
+        if slope_stab_result is None:
+            st.warning("Slope stability was not run in the last calculation. Ensure the checkbox is enabled and click Run.")
+            trials_df = pd.DataFrame()
+            trial_details = {}
+            geom = {}
+        else:
+            trials_df = slope_stab_result.get("trials_df", pd.DataFrame())
+            trial_details = slope_stab_result.get("trial_details", {})
+            geom = slope_stab_result.get("geometry", {})
         if trials_df.empty:
             st.error("No slope stability trials were generated.")
         else:
@@ -3741,23 +3822,25 @@ if df1 is not None:
             construction = geom.get("construction", {})
             cu_used = float(geom.get("cu_kpa_used", SLOPE_STABILITY_CU_KPA))
 
-            trial_ids = trials_df["trial_id"].astype(str).tolist()
-            if trial_ids:
-                fos_series_for_pick = pd.to_numeric(trials_df["FoS"], errors="coerce")
-                if fos_series_for_pick.notna().any():
-                    governing_idx = int(fos_series_for_pick.idxmin())
-                    selected_trial_for_slices = str(trials_df.loc[governing_idx, "trial_id"])
-                else:
-                    selected_trial_for_slices = str(trial_ids[0])
-            else:
-                selected_trial_for_slices = "A"
-            st.caption(f"Slice lines fixed to governing trial: {selected_trial_for_slices}")
+            trial_ids = list(trials_df["trial_id"].astype(str))
+            if st.session_state["slope_selected_trial"] not in trial_ids:
+                st.session_state["slope_selected_trial"] = trial_ids[0] if trial_ids else "H"
+            selected_trial_for_slices = st.selectbox(
+                "Select centre (trial_id)",
+                options=trial_ids,
+                index=trial_ids.index(st.session_state["slope_selected_trial"]),
+                key="slope_selected_trial",
+            )
 
             x_left = float(construction.get("x_left", min(float(toe[0]), float(crest[0]))))
             x_right = float(construction.get("x_right", max(float(toe[0]), float(crest[0]))))
-            half_w = max(80.0, B_base / 2.0 + max(25.0, 4.5 * max(1.0, H_emb)))
-            x_lo = min(-half_w, x_left - 0.8 * max(1.0, H_emb))
-            x_hi = max(+half_w, x_right + 0.8 * max(1.0, H_emb))
+            # Keep the left side compact so the slope/circles occupy more of the figure.
+            x_lo = -20.0
+            x_hi = max(
+                x_right + 1.4 * max(1.0, H_emb),
+                float(toe[0]) + 1.2 * max(1.0, H_emb),
+                float(crest[0]) + 1.8 * max(1.0, H_emb),
+            )
             x_plot = np.linspace(x_lo, x_hi, 400)
             z_plot = np.array([z_surface_half(x, ground_z, z_finish, side_name, B_top_plot, B_base) for x in x_plot])
 
@@ -3766,7 +3849,7 @@ if df1 is not None:
             # -----------------------------
             # STAGE 0: GEOMETRY ONLY (RESET)
             # -----------------------------
-            fig_all, ax_all = plt.subplots(figsize=(12, 7))
+            fig_all, ax_all = plt.subplots(figsize=(8.5, 8.5))
 
             ax_all.set_xlabel("Horizontal y (m)")
             ax_all.set_ylabel("Level (mAOD)")
