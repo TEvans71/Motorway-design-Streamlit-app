@@ -3333,7 +3333,7 @@ if df1 is not None:
             ax_slope.set_xlim(-half_w, half_w)
             ax_slope.set_ylim(min(ground_z - 2.5 * max(1.0, geom.get("H", 1.0)), z_c_sel - R_sel - 2.0), max(z_finish + 4.0, z_c_sel + R_sel + 2.0))
             ax_slope.grid(True, alpha=0.3)
-            ax_slope.legend(loc="upper right")
+            ax_slope.legend(loc="upper left")
             ax_slope.set_aspect("equal", adjustable="box")
             plt.tight_layout()
             st.pyplot(fig_slope)
