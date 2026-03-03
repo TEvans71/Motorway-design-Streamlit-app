@@ -259,13 +259,9 @@ def render_project_inputs_locked(coursework_inputs: dict):
     st.sidebar.header("Project Inputs")
     st.sidebar.caption(f"Build: {APP_BUILD}")
     for section_name, items in coursework_inputs.items():
-        st.sidebar.subheader(section_name)
-        rows = [
-            {"Parameter": item["label"], "Value": _format_locked_value(item)}
-            for item in items
-        ]
-        df = pd.DataFrame(rows, columns=["Parameter", "Value"])
-        st.sidebar.dataframe(df, use_container_width=True, hide_index=True)
+        with st.sidebar.expander(section_name, expanded=False):
+            for item in items:
+                st.write(f"**{item['label']}** — {_format_locked_value(item)}")
 
 # =============================================================================
 # 2) HELPERS — WEEK 1 (Ted's logic, unchanged)
@@ -1571,7 +1567,7 @@ def phi0_slices_fos(surface_z: Callable[[float], float], ground_z: float,
         "sum_Di": 0.0,
     }
     columns = ["slice", "b", "z_surf", "z_base", "h", "A_fill", "A_clay", "W",
-               "alpha_deg", "sec(α)", "sin(α)", "Ti=Cu·b·sec", "Di=W·sin"]
+               "alpha_deg", "sec_a", "sin_a", "Ti", "Di"]
     if R <= 0.0 or int(n_slices) <= 0:
         meta["reason"] = "invalid_radius_or_slices"
         return (float("nan"), pd.DataFrame(columns=columns), meta)
@@ -1650,10 +1646,10 @@ def phi0_slices_fos(surface_z: Callable[[float], float], ground_z: float,
             "A_clay": A_clay,
             "W": W,
             "alpha_deg": math.degrees(alpha),  # signed: negative left of centre, positive right
-            "sec(α)": sec_a,
-            "sin(α)": sin_a,            # signed — matches ΣW·sin(α) in lecture formula
-            "Ti=Cu·b·sec": Ti,
-            "Di=W·sin": Di,             # negative for passive slices
+            "sec_a": sec_a,
+            "sin_a": sin_a,     # signed — negative for passive (left-side) slices
+            "Ti": Ti,
+            "Di": Di,           # negative for passive slices
         })
     fos = float(sum_Ti / sum_Di) if sum_Di > 0.0 else float("nan")
     slices_df = pd.DataFrame(rows, columns=columns)
@@ -3502,10 +3498,10 @@ if df1 is not None:
                 _sDi = trial_meta.get("sum_Di", float("nan"))
                 if np.isfinite(float(selected_row["FoS"])):
                     st.caption(
-                        f"**ΣTi = ΣCu·b·sec(α) = {_sTi:.3f}**  |  "
-                        f"**ΣDi = ΣW·sin(α) = {_sDi:.3f}**  "
-                        f"*(signed — passive slices subtract)*  |  "
-                        f"**FoS = {_sTi:.3f} / {_sDi:.3f} = {float(selected_row['FoS']):.4f}**"
+                        f"Sum Ti = Cu x b x sec(a) = {_sTi:.3f}  |  "
+                        f"Sum Di = W x sin(a) = {_sDi:.3f}  "
+                        f"(signed: passive slices subtract)  |  "
+                        f"FoS = {_sTi:.3f} / {_sDi:.3f} = {float(selected_row['FoS']):.4f}"
                     )
                 else:
                     st.caption("Trial invalid — check geometry or centre position.")
