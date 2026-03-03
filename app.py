@@ -1766,6 +1766,13 @@ def run_phi0_trials(df1: pd.DataFrame, x_stability: float, B_top: float, side: s
     crest = (float(x_crest), float(z_finish))
     surface_fn = lambda x: z_surface_half(float(x), ground_z, z_finish, side_name, B_top, B_base)
     construction = _build_slope_stability_centres(toe=toe, crest=crest, H=H)
+    x_left = float(construction.get("x_left", min(float(toe[0]), float(crest[0]))))
+    x_right = float(construction.get("x_right", max(float(toe[0]), float(crest[0]))))
+    half_w = max(80.0, B_base / 2.0 + max(25.0, 4.5 * max(1.0, H)))
+    x_lo = min(-half_w, x_left - 0.8 * max(1.0, H))
+    x_hi = max(+half_w, x_right + 0.8 * max(1.0, H))
+    xs_diag = np.linspace(x_lo, x_hi, 1400)
+    zs_diag = np.array([surface_fn(float(x)) for x in xs_diag], dtype=float)
     trial_rows = []
     trial_details = {}
     for c in construction["centres"]:
@@ -1777,12 +1784,52 @@ def run_phi0_trials(df1: pd.DataFrame, x_stability: float, B_top: float, side: s
             "slice_no", "x_mid", "b_m", "z_top", "z_bottom", "area_m2", "gamma_kN_per_m3", "W_kN",
             "alpha_rad", "alpha_deg", "sec_alpha", "W_sin_alpha", "cu_kPa", "Ti_cubseca", "Di_Wsina",
         ])
-        meta = {"valid": False, "reason": None, "R": R}
+        rad_diag = R * R - (xs_diag - x_c) ** 2
+        has_real_circle_points = bool(np.any(rad_diag >= 0.0))
+        zs_circle_diag = np.full_like(xs_diag, np.nan, dtype=float)
+        ok_diag = rad_diag >= 0.0
+        zs_circle_diag[ok_diag] = z_c - np.sqrt(rad_diag[ok_diag])
+        mask_diag = ok_diag & (zs_circle_diag <= zs_diag)
+        idx_diag = np.where(mask_diag)[0]
+        mask_true_count = int(idx_diag.size)
+        mask_true_fraction = float(mask_true_count / len(xs_diag)) if len(xs_diag) > 0 else 0.0
+        diag_runs = []
+        if idx_diag.size > 0:
+            start_i = int(idx_diag[0])
+            prev_i = int(idx_diag[0])
+            for cur_i in idx_diag[1:]:
+                cur_i = int(cur_i)
+                if cur_i - prev_i > 1:
+                    diag_runs.append((start_i, prev_i))
+                    start_i = cur_i
+                prev_i = cur_i
+            diag_runs.append((start_i, prev_i))
+        n_true_segments = int(len(diag_runs))
+        if n_true_segments > 0:
+            chosen_start_i, chosen_end_i = max(diag_runs, key=lambda ab: (ab[1] - ab[0] + 1))
+            x_min_arc = float(xs_diag[chosen_start_i])
+            x_max_arc = float(xs_diag[chosen_end_i])
+        else:
+            x_min_arc = None
+            x_max_arc = None
+        meta = {
+            "valid": False,
+            "reason": None,
+            "R": R,
+            "has_real_circle_points": has_real_circle_points,
+            "mask_true_count": mask_true_count,
+            "mask_true_fraction": mask_true_fraction,
+            "n_true_segments": n_true_segments,
+            "x_min_arc": x_min_arc,
+            "x_max_arc": x_max_arc,
+            "sum_Ti": None,
+            "sum_Di": None,
+        }
         fos = float("nan")
         if H <= 0.0:
             meta["reason"] = "zero_embankment_height"
         else:
-            fos, slices_df, meta = phi0_slices_fos(
+            fos, slices_df, calc_meta = phi0_slices_fos(
                 surface_z=surface_fn,
                 ground_z=ground_z,
                 toe=toe,
@@ -1794,8 +1841,32 @@ def run_phi0_trials(df1: pd.DataFrame, x_stability: float, B_top: float, side: s
                 gamma_clay=gamma_clay,
                 n_slices=int(n_slices),
             )
-            if not np.isfinite(fos) and not meta.get("reason"):
-                meta["reason"] = "invalid_unknown"
+            meta.update(calc_meta)
+            if "sum_Ti" in calc_meta:
+                meta["sum_Ti"] = calc_meta.get("sum_Ti")
+            if "sum_Di" in calc_meta:
+                meta["sum_Di"] = calc_meta.get("sum_Di")
+            sum_Di_meta = meta.get("sum_Di")
+            slices_computed = slices_df is not None and not slices_df.empty
+            if not meta.get("has_real_circle_points", False):
+                meta["reason"] = "no_real_circle_points_in_plot_range"
+            elif int(meta.get("mask_true_count", 0)) == 0:
+                meta["reason"] = "no_slip_arc_below_surface"
+            elif int(meta.get("n_true_segments", 0)) == 0:
+                meta["reason"] = "no_continuous_slip_segment"
+            elif (
+                meta.get("x_min_arc") is None
+                or meta.get("x_max_arc") is None
+                or (float(meta.get("x_max_arc")) - float(meta.get("x_min_arc"))) < 1e-6
+            ):
+                meta["reason"] = "degenerate_arc_span"
+            elif slices_computed and (sum_Di_meta is not None) and (float(sum_Di_meta) <= 0.0):
+                meta["reason"] = "zero_or_negative_driving_sum"
+            elif not np.isfinite(fos):
+                meta["reason"] = "numerical_failure"
+            else:
+                meta["reason"] = None
+                meta["valid"] = True
         meta["trial_id"] = trial_id
         meta["x_c"] = x_c
         meta["z_c"] = z_c
@@ -1808,7 +1879,7 @@ def run_phi0_trials(df1: pd.DataFrame, x_stability: float, B_top: float, side: s
             "radius": R,
             "FoS": fos,
             "PASS/FAIL": pass_fail,
-            "status": "valid" if np.isfinite(fos) else f"invalid ({meta.get('reason') or 'unknown'})",
+            "status": "valid" if np.isfinite(fos) else f"invalid ({meta.get('reason') or 'numerical_failure'})",
         })
     trials_df = pd.DataFrame(trial_rows).sort_values(by="FoS", ascending=True, na_position="last").reset_index(drop=True)
     geometry = {
@@ -3864,6 +3935,16 @@ if df1 is not None:
             table_df = trials_df[display_cols].copy()
             st.subheader("Trial Results Table")
             st.dataframe(table_df, use_container_width=True, hide_index=True)
+            with st.expander("DEBUG — trial meta", expanded=False):
+                debug_trial_id = st.selectbox(
+                    "Select trial_id",
+                    options=trial_ids if trial_ids else ["A"],
+                    index=0,
+                    key="slope_trial_meta_debug_id",
+                )
+                _, debug_meta = trial_details.get(str(debug_trial_id), (pd.DataFrame(), {}))
+                debug_rows = [{"key": str(k), "value": v} for k, v in dict(debug_meta).items()]
+                st.dataframe(pd.DataFrame(debug_rows), use_container_width=True, hide_index=True)
 
             with st.expander("Arc endpoint debug (toe/crest/intersections)", expanded=False):
                 toe_tol_dbg = 1e-3
