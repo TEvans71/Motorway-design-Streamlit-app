@@ -2627,6 +2627,9 @@ slope_stab_result = None
 csv_paths = {}
 x0_summary = None
 
+if "main_results_cache" not in st.session_state:
+    st.session_state["main_results_cache"] = None
+
 if run_btn:
     with st.spinner("Calculating..."):
         (
@@ -2709,10 +2712,68 @@ if run_btn:
                 "geometry": trial_geom,
             }
         x0_summary = summarize_x0_settlement_and_consolidation(layer_table_x0, week2_chainage_df)
+        st.session_state["main_results_cache"] = {
+            "df1": df1,
+            "key_df": key_df,
+            "report_df": report_df,
+            "summary_df": summary_df,
+            "week2_chainage_df": week2_chainage_df,
+            "week2_chainage_pvd_df": week2_chainage_pvd_df,
+            "pvd_design": pvd_design,
+            "pvd_design_summary_df": pvd_design_summary_df,
+            "out_path": out_path,
+            "layers_df_for_x_section": layers_df_for_x_section,
+            "immediate_stage_df_x_section": immediate_stage_df_x_section,
+            "layer_table_x0": layer_table_x0,
+            "settlement_summary": settlement_summary,
+            "neg_dsigma_chainages": neg_dsigma_chainages,
+            "monotonic_warnings": monotonic_warnings,
+            "quick_stage_df": quick_stage_df,
+            "no_allow_violations_quick": no_allow_violations_quick,
+            "flood_violations_quick": flood_violations_quick,
+            "grade_violations": grade_violations,
+            "grade_slopes": grade_slopes,
+            "detailed_stage2_df": detailed_stage2_df,
+            "flood_violations_stage2": flood_violations_stage2,
+            "grade_violations_stage2": grade_violations_stage2,
+            "grade_slopes_stage2": grade_slopes_stage2,
+            "slope_stab_result": slope_stab_result,
+            "csv_paths": csv_paths,
+            "x0_summary": x0_summary,
+        }
     csv_note = ""
     if csv_paths:
         csv_note = " | CSV: " + ", ".join([os.path.basename(p) for p in csv_paths.values()])
     st.success("Done. Excel saved to " + str(out_path) + csv_note)
+elif st.session_state["main_results_cache"] is not None:
+    _cache = st.session_state["main_results_cache"]
+    df1 = _cache.get("df1")
+    key_df = _cache.get("key_df")
+    report_df = _cache.get("report_df")
+    summary_df = _cache.get("summary_df")
+    week2_chainage_df = _cache.get("week2_chainage_df")
+    week2_chainage_pvd_df = _cache.get("week2_chainage_pvd_df")
+    pvd_design = _cache.get("pvd_design")
+    pvd_design_summary_df = _cache.get("pvd_design_summary_df")
+    out_path = _cache.get("out_path")
+    layers_df_for_x_section = _cache.get("layers_df_for_x_section")
+    immediate_stage_df_x_section = _cache.get("immediate_stage_df_x_section")
+    layer_table_x0 = _cache.get("layer_table_x0")
+    settlement_summary = _cache.get("settlement_summary", [])
+    neg_dsigma_chainages = _cache.get("neg_dsigma_chainages", [])
+    monotonic_warnings = _cache.get("monotonic_warnings", [])
+    quick_stage_df = _cache.get("quick_stage_df")
+    no_allow_violations_quick = _cache.get("no_allow_violations_quick", [])
+    flood_violations_quick = _cache.get("flood_violations_quick", [])
+    grade_violations = _cache.get("grade_violations", [])
+    grade_slopes = _cache.get("grade_slopes", [])
+    detailed_stage2_df = _cache.get("detailed_stage2_df")
+    flood_violations_stage2 = _cache.get("flood_violations_stage2", [])
+    grade_violations_stage2 = _cache.get("grade_violations_stage2", [])
+    grade_slopes_stage2 = _cache.get("grade_slopes_stage2", [])
+    slope_stab_result = _cache.get("slope_stab_result")
+    csv_paths = _cache.get("csv_paths", {})
+    x0_summary = _cache.get("x0_summary")
 
 left_col, right_col = st.columns([1, 3], gap="large")
 
@@ -3835,12 +3896,27 @@ if df1 is not None:
             trial_ids = list(trials_df["trial_id"].astype(str))
             if st.session_state["slope_selected_trial"] not in trial_ids:
                 st.session_state["slope_selected_trial"] = trial_ids[0] if trial_ids else "H"
-            selected_trial_for_slices = st.selectbox(
-                "Select centre (trial_id)",
-                options=trial_ids,
-                index=trial_ids.index(st.session_state["slope_selected_trial"]),
-                key="slope_selected_trial",
-            )
+            if "slope_selected_trial_candidate" not in st.session_state:
+                st.session_state["slope_selected_trial_candidate"] = st.session_state["slope_selected_trial"]
+            if st.session_state["slope_selected_trial_candidate"] not in trial_ids:
+                st.session_state["slope_selected_trial_candidate"] = st.session_state["slope_selected_trial"]
+
+            with st.form("slope_trial_select_form", clear_on_submit=False):
+                select_col, confirm_col = st.columns([4, 1])
+                with select_col:
+                    st.selectbox(
+                        "Select centre (trial_id)",
+                        options=trial_ids,
+                        index=trial_ids.index(st.session_state["slope_selected_trial_candidate"]),
+                        key="slope_selected_trial_candidate",
+                    )
+                with confirm_col:
+                    confirm_trial_btn = st.form_submit_button("Confirm centre")
+
+            if confirm_trial_btn:
+                st.session_state["slope_selected_trial"] = str(st.session_state["slope_selected_trial_candidate"])
+
+            selected_trial_for_slices = str(st.session_state["slope_selected_trial"])
 
             x_left = float(construction.get("x_left", min(float(toe[0]), float(crest[0]))))
             x_right = float(construction.get("x_right", max(float(toe[0]), float(crest[0]))))
@@ -4029,12 +4105,8 @@ if df1 is not None:
             st.subheader("Trial Results Table")
             st.dataframe(table_df, use_container_width=True, hide_index=True)
             with st.expander("DEBUG — trial meta", expanded=False):
-                debug_trial_id = st.selectbox(
-                    "Select trial_id",
-                    options=trial_ids if trial_ids else ["A"],
-                    index=0,
-                    key="slope_trial_meta_debug_id",
-                )
+                debug_trial_id = str(selected_trial_for_slices)
+                st.caption(f"Showing meta for selected centre: {debug_trial_id}")
                 _, debug_meta = trial_details.get(str(debug_trial_id), (pd.DataFrame(), {}))
                 debug_rows = [{"key": str(k), "value": v} for k, v in dict(debug_meta).items()]
                 st.dataframe(pd.DataFrame(debug_rows), use_container_width=True, hide_index=True)
