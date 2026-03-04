@@ -3682,19 +3682,6 @@ if df1 is not None:
             st.warning("t90 > 5 years: long-term consolidation settlement likely (programme risk).")
     with st.expander("Details — consolidation vertical table", expanded=False):
         st.dataframe(week2_chainage_df, use_container_width=True, hide_index=True)
-    if week2_chainage_pvd_df is not None and len(week2_chainage_pvd_df) > 0:
-        st.subheader("Consolidation Time (Sand drain combined)")
-        t90_col_pvd = "U90_t_years"
-        with st.expander("Details — consolidation Sand drain table", expanded=False):
-            st.dataframe(
-                week2_chainage_pvd_df,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Cv_m2_per_s": st.column_config.NumberColumn("Cv_m2_per_s", format="%.1e"),
-                    "Ch_m2_per_s": st.column_config.NumberColumn("Ch_m2_per_s", format="%.1e"),
-                },
-            )
     with st.expander("Formulas used", expanded=False):
         st.latex(r"T_v = \frac{C_v \, t}{H_d^2} \implies t = \frac{T_v \, H_d^2}{C_v}")
         st.markdown(r"**U(T_v) series:** $U = 1 - \sum_{n=0}^{\infty}\frac{8}{\pi^2(2n+1)^2}e^{-(2n+1)^2\pi^2 T_v/4}$")
